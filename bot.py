@@ -28,14 +28,12 @@ from telegram.ext import (
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
-MODEL            = "gpt-4.1-mini"
-MAX_HISTORY      = 40
-VECTOR_STORE_ID  = "vs_6a29d6c99c008191b051906ee0a87b5d"  # შენი Vector Store
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
+MODEL           = "gpt-4.1-mini"
+MAX_HISTORY     = 40
+VECTOR_STORE_ID = "vs_6a29d6c99c008191b051906ee0a87b5d"
 
-# /data არის Railway-ს persistent Volume.
-# ლოკალურად მუშაობისას იყენებს memory.db-ს მიმდინარე ფოლდერში.
 DB_PATH = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
 
 SYSTEM_PROMPT = """You are a professional accounting assistant for startups.
@@ -176,16 +174,15 @@ def get_lock(user_id: int) -> asyncio.Lock:
 
 async def ask_openai(user_id: int, user_text: str) -> str:
     messages = build_messages(user_id, user_text)
-    response = await client.chat.completions.create(
+    response = await client.responses.create(
         model=MODEL,
-        messages=messages,
-        max_tokens=1000,
+        input=messages,
         tools=[{
             "type": "file_search",
             "vector_store_ids": [VECTOR_STORE_ID]
         }],
     )
-    return response.choices[0].message.content.strip()
+    return response.output_text.strip()
 
 
 # ─── Telegram handlers ───────────────────────────────────────────────────────
@@ -233,7 +230,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.from_user.id
     user_text = update.message.text.strip()
 
-    # ── remember: command ─────────────────────────────────────────────────────
     if user_text.lower().startswith("remember:"):
         fact = user_text[len("remember:"):].strip()
         if fact:
@@ -247,7 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── normal conversation ───────────────────────────────────────────────────
     async with get_lock(user_id):
         await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
