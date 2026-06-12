@@ -7,8 +7,6 @@ Georgian Financial Assistant Telegram Bot
 - Text-based reset with confirmation dialog
 - Georgian tax deadline reminders (personalized by tax regime)
 - /edit command to edit saved facts
-- PDF/Image/Screenshot document analysis (max 5MB)
-- Voice message transcription and response
 - Monthly financial tracker (/tracker)
 - /export command to export business profile
 - Multi-language support (Georgian/English/Russian)
@@ -49,7 +47,6 @@ VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 MODEL          = "gpt-4.1-mini"
 MAX_HISTORY    = 50
 DB_PATH        = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
-MAX_FILE_BYTES = 5 * 1024 * 1024  # 5MB
 
 RESET_TRIGGERS = {
     "წაშალე", "ყველაფერი წაშალე", "თავიდან დავიწყოთ", "თავიდან",
@@ -222,27 +219,6 @@ Q3: თანამშრომლები გყავს?
 Q4: რა გჭირდება ახლა — გადასახადები, დეკლარაცია, ფინანსური გეგმა, სხვა?
 """
 
-DOCUMENT_PROMPT = """You are analyzing a document or screenshot uploaded by a Georgian business owner.
-
-This might be:
-- A screenshot of rs.ge portal - guide them through what to do next
-- A financial document - extract key figures and facts
-- A tax declaration form - analyze and advise
-- Any other business document
-
-Tasks:
-1. Identify what the document/screenshot shows
-2. Extract ALL relevant financial figures, dates, and facts
-3. If it's a portal screenshot, give specific next-step instructions
-4. Answer the user's question if they asked one
-5. Save important facts using SAVE: format
-
-LANGUAGE: Respond in the same language as the user's caption or previous messages.
-Be specific — reference exact numbers, buttons, and field names visible in the document.
-
-At the end save relevant facts:
-SAVE: [fact from document]
-"""
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -552,49 +528,6 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
     return extract_and_clean(user_id, response.output_text.strip())
 
 
-async def transcribe_voice(file_bytes: bytes) -> str:
-    """Transcribe voice message using OpenAI Whisper."""
-    import io
-    audio_file = io.BytesIO(file_bytes)
-    audio_file.name = "voice.ogg"
-    result = await client.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_file,
-    )
-    return result.text
-
-
-async def analyze_document(user_id: int, file_bytes: bytes, mime_type: str, caption: str = "") -> str:
-    import base64
-    memories = load_memories(user_id)
-    memory_block = ""
-    if memories:
-        facts = "\n".join(f"  - {f}" for f in memories)
-        memory_block = f"\n\nClient's saved facts:\n{facts}"
-
-    system_content = DOCUMENT_PROMPT + memory_block
-    user_question  = caption if caption else "გაანალიზე ეს დოკუმენტი/სქრინშოტი და მითხარი რა შეიცავს და რა უნდა გავაკეთო."
-    b64            = base64.b64encode(file_bytes).decode()
-
-    if mime_type in ("image/jpeg", "image/png", "image/webp", "image/gif"):
-        user_content = [
-            {"type": "input_image", "image_url": f"data:{mime_type};base64,{b64}"},
-            {"type": "input_text",  "text": user_question},
-        ]
-    else:
-        user_content = [
-            {"type": "input_file", "filename": "document.pdf", "file_data": f"data:{mime_type};base64,{b64}"},
-            {"type": "input_text", "text": user_question},
-        ]
-
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user",   "content": user_content},
-    ]
-    response = await client.responses.create(model=MODEL, input=messages)
-    return extract_and_clean(user_id, response.output_text.strip())
-
-
 # ─── Export helper ────────────────────────────────────────────────────────────
 
 def build_export_text(user_id: int) -> str:
@@ -784,9 +717,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/deadlines — საგადასახადო ვადები\n"
         "/forget — ინფოს წაშლა\n"
         "/reset — საუბრის ისტორიის წაშლა\n\n"
-        "📎 *ფაილები და სქრინშოტები:*\n"
         "გამომიგზავნე PDF, Word, ფოტო ან rs.ge სქრინშოტი (მაქს. 5MB)\n\n"
-        "🎤 *ხმოვანი:*\n"
         "გამომიგზავნე ხმოვანი შეტყობინება — ვისმენ და ვპასუხობ\n\n"
         "💡 ნებისმიერ დროს შეგიძლია კითხვა დამისვა!",
         parse_mode="Markdown",
@@ -875,95 +806,7 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Document handler ─────────────────────────────────────────────────────────
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.message.from_user.id
-    caption  = update.message.caption or ""
-    ob_state = get_onboarding_state(user_id)
-
-    if ob_state == "none":
-        await send_onboarding_choice(update)
-        return
-
-    if update.message.document:
-        doc       = update.message.document
-        mime_type = doc.mime_type or "application/octet-stream"
-        file_size = doc.file_size or 0
-        file_obj  = doc
-        allowed   = (
-            "application/pdf",
-            "application/msword",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "image/jpeg", "image/png", "image/webp",
-        )
-        if mime_type not in allowed:
-            await update.message.reply_text(
-                "❌ ეს ფაილის ტიპი არ არის მხარდაჭერილი.\n\n"
-                "გამომიგზავნე: PDF, Word, JPG/PNG ან სქრინშოტი"
-            )
-            return
-    elif update.message.photo:
-        photo     = update.message.photo[-1]
-        file_size = photo.file_size or 0
-        mime_type = "image/jpeg"
-        file_obj  = photo
-    else:
-        return
-
-    if file_size > MAX_FILE_BYTES:
-        await update.message.reply_text(
-            f"❌ ფაილი ძალიან დიდია.\nმაქსიმუმი: 5MB"
-        )
-        return
-
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    await update.message.reply_text("📄 ვანალიზებ...")
-
-    try:
-        tg_file    = await context.bot.get_file(file_obj.file_id)
-        file_bytes = bytes(await tg_file.download_as_bytearray())
-        reply      = await analyze_document(user_id, file_bytes, mime_type, caption)
-    except Exception as e:
-        log.error("Document error [%s]: %s", user_id, e)
-        await update.message.reply_text("❌ ანალიზი ვერ მოხერხდა. სცადე თავიდან.")
-        return
-
-    save_message(user_id, "user", f"[დოკუმენტი/სქრინშოტი] {caption}")
-    save_message(user_id, "assistant", reply)
-
-    if get_onboarding_state(user_id) == "done":
-        await update.message.reply_text(reply, reply_markup=main_menu_keyboard())
-    else:
-        await update.message.reply_text(reply)
-
-
 # ─── Voice handler ────────────────────────────────────────────────────────────
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.message.from_user.id
-    ob_state = get_onboarding_state(user_id)
-
-    if ob_state == "none":
-        await send_onboarding_choice(update)
-        return
-
-    await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    await update.message.reply_text("🎤 ვისმენ...")
-
-    try:
-        voice      = update.message.voice
-        tg_file    = await context.bot.get_file(voice.file_id)
-        file_bytes = bytes(await tg_file.download_as_bytearray())
-        text       = await transcribe_voice(file_bytes)
-    except Exception as e:
-        log.error("Voice error [%s]: %s", user_id, e)
-        await update.message.reply_text("❌ ხმოვანი შეტყობინება ვერ მოვისმინე. სცადე თავიდან.")
-        return
-
-    await update.message.reply_text(f"🗣 *შენ:* _{text}_", parse_mode="Markdown")
-
-    mode = ob_state if ob_state in ("full", "quick") else "chat"
-    await run_ai_and_reply(update, context, user_id, text, mode=mode)
-
 
 # ─── Callback query handler ───────────────────────────────────────────────────
 
@@ -1222,9 +1065,6 @@ def main():
     app.add_handler(CommandHandler("switch",    cmd_switch))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
-    app.add_handler(MessageHandler(filters.PHOTO,                   handle_document))
-    app.add_handler(MessageHandler(filters.VOICE,                   handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_daily(
