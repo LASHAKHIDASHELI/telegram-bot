@@ -4,7 +4,7 @@ Georgian Financial Assistant Telegram Bot
 - Smart onboarding: detailed (13 questions) or quick (4 questions)
 - /switch command to change mode without losing data
 - Auto-saves business facts from conversation
-- Text-based reset detection
+- Text-based reset with confirmation dialog
 - Georgian tax deadline reminders
 - /edit command to edit saved facts
 - 50-message chat history
@@ -20,7 +20,7 @@ import os
 import sqlite3
 import asyncio
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from contextlib import contextmanager
 
 from openai import AsyncOpenAI
@@ -44,7 +44,7 @@ MODEL       = "gpt-4.1-mini"
 MAX_HISTORY = 50
 DB_PATH     = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
 
-# Words that trigger instant reset (no AI call needed)
+# Words that trigger reset confirmation dialog
 RESET_TRIGGERS = {
     "წაშალე", "ყველაფერი წაშალე", "თავიდან დავიწყოთ", "თავიდან",
     "გასუფთავება", "დასუფთავება", "ყველაფერი", "reset", "clear",
@@ -54,28 +54,21 @@ RESET_TRIGGERS = {
 # ─── Georgian tax deadlines ───────────────────────────────────────────────────
 
 def get_upcoming_deadlines(days_ahead: int = 7) -> list[str]:
-    """Return tax deadlines within the next `days_ahead` days."""
-    today    = date.today()
-    upcoming = []
-    year     = today.year
-
+    today     = date.today()
+    year      = today.year
     deadlines = []
 
-    # მცირე ბიზნესი — ყოველი კვარტლის 15
-    for month in [4, 7, 10, 1]:
-        y = year if month != 1 else year + 1
-        deadlines.append((date(y, month, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
+    for month in [4, 7, 10]:
+        deadlines.append((date(year, month, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
+    deadlines.append((date(year + 1, 1, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
 
-    # დღგ — ყოველი თვის 15
     for month in range(1, 13):
         deadlines.append((date(year, month, 15), f"დღგ-ს დეკლარაცია ({month} თვე)"))
 
-    # საშემოსავლო — 1 აპრილი
     deadlines.append((date(year, 4, 1), "წლიური საშემოსავლო გადასახადის დეკლარაცია"))
-
-    # მოგების გადასახადი — 1 აპრილი
     deadlines.append((date(year, 4, 1), "კორპორაციული მოგების გადასახადი"))
 
+    upcoming = []
     for deadline_date, name in deadlines:
         delta = (deadline_date - today).days
         if 0 <= delta <= days_ahead:
@@ -85,19 +78,17 @@ def get_upcoming_deadlines(days_ahead: int = 7) -> list[str]:
                 upcoming.append(f"🟠 *ხვალ* — {name}")
             else:
                 upcoming.append(f"🟡 *{delta} დღეში* ({deadline_date.strftime('%d.%m')}) — {name}")
-
     return upcoming
 
 
 async def send_reminders(app):
-    """Called daily at 9:00 — send deadline reminders to all users."""
     deadlines = get_upcoming_deadlines(days_ahead=7)
     if not deadlines:
         return
-
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT DISTINCT user_id FROM user_state WHERE onboarding='done'").fetchall()
-
+        rows = conn.execute(
+            "SELECT DISTINCT user_id FROM user_state WHERE onboarding='done'"
+        ).fetchall()
     for row in rows:
         user_id = row[0]
         text    = "📅 *საგადასახადო შეხსენება*\n\n" + "\n".join(deadlines)
@@ -146,12 +137,12 @@ SAVE: main expenses — salaries, office rent, marketing
 If the user CORRECTS a previously saved fact:
 UPDATE: [old fact keyword] → [new fact]
 
-## ⚠️ CRITICAL ONBOARDING RULES — MUST FOLLOW EXACTLY
+## ⚠️ CRITICAL ONBOARDING RULES
 RULE 1: Send EXACTLY ONE question per message. ONE. Never two. Never three.
 RULE 2: Do NOT combine questions with "და", "ასევე", "გარდა ამისა", "and", "also".
-RULE 3: Count the "?" marks in your message before sending. If there are 2 or more — rewrite.
+RULE 3: Count the "?" marks in your message. If there are 2 or more — rewrite.
 RULE 4: After the user answers, write SAVE: for that fact, then ask the NEXT single question.
-RULE 5: If user asks for clarification mid-onboarding, answer it, then ask the SAME question again.
+RULE 5: If user asks for clarification, answer it, then ask the SAME question again.
 RULE 6: Short questions only. Maximum 2 sentences per question message.
 RULE 7: End your last onboarding message with: ONBOARDING_COMPLETE
 
@@ -197,17 +188,14 @@ def init_db():
                 content    TEXT    NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id    INTEGER PRIMARY KEY,
                 onboarding TEXT    DEFAULT 'none',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-
             CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         """)
 
-        # Rebuild memories table with correct schema
         db.execute("""
             CREATE TABLE IF NOT EXISTS memories_new (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,7 +224,6 @@ def init_db():
                 pass
 
         db.execute("CREATE INDEX IF NOT EXISTS idx_memory_user ON memories(user_id)")
-
     log.info("DB ready at %s", DB_PATH)
 
 
@@ -288,7 +275,6 @@ def load_memories(user_id: int) -> list[str]:
 
 
 def load_memories_with_keys(user_id: int) -> list[tuple[str, str]]:
-    """Returns list of (mem_key, fact) tuples."""
     with get_db() as db:
         rows = db.execute(
             "SELECT mem_key, fact FROM memories WHERE user_id = ? ORDER BY created_at",
@@ -318,7 +304,6 @@ def update_memory(user_id: int, old_keyword: str, new_fact: str):
     with get_db() as db:
         db.execute("DELETE FROM memories WHERE user_id = ? AND mem_key = ?", (user_id, old_key))
         db.execute("INSERT INTO memories(user_id, mem_key, fact) VALUES(?, ?, ?)", (user_id, new_key, new_fact))
-    log.info("Memory updated [%s]: %s -> %s", user_id, old_keyword, new_fact)
 
 
 def clear_memories(user_id: int):
@@ -437,17 +422,26 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 ჩემი ინფო",    callback_data="show_memories"),
-            InlineKeyboardButton("✏️ რედაქტირება",   callback_data="edit_memories"),
+            InlineKeyboardButton("📋 ჩემი ინფო",   callback_data="show_memories"),
+            InlineKeyboardButton("✏️ რედაქტირება",  callback_data="edit_memories"),
         ],
         [
-            InlineKeyboardButton("🔄 კითხვარი",      callback_data="switch_menu"),
-            InlineKeyboardButton("📅 ვადები",         callback_data="show_deadlines"),
+            InlineKeyboardButton("🔄 კითხვარი",     callback_data="switch_menu"),
+            InlineKeyboardButton("📅 ვადები",        callback_data="show_deadlines"),
         ],
         [
-            InlineKeyboardButton("🗑 ინფო წაშლა",    callback_data="forget"),
-            InlineKeyboardButton("🔃 ისტ. წაშლა",    callback_data="reset"),
+            InlineKeyboardButton("🗑 ინფო წაშლა",   callback_data="forget"),
+            InlineKeyboardButton("🔃 ისტ. წაშლა",   callback_data="reset"),
         ],
+    ])
+
+
+def confirm_reset_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ კი, წაშალე",  callback_data="confirm_reset"),
+            InlineKeyboardButton("❌ არა, გავაგრძელო", callback_data="cancel_reset"),
+        ]
     ])
 
 
@@ -467,7 +461,6 @@ def onboarding_keyboard():
 
 
 def edit_list_keyboard(memories: list[tuple[str, str]]):
-    """Show each saved fact as a button to delete it."""
     buttons = []
     for mem_key, fact in memories:
         label = fact[:40] + ("…" if len(fact) > 40 else "")
@@ -493,13 +486,10 @@ async def send_onboarding_choice(update: Update, edit: bool = False):
 
 
 async def do_full_reset(user_id: int, update: Update):
-    """Wipe all data and show onboarding choice."""
     clear_memories(user_id)
     clear_history(user_id)
     set_onboarding_state(user_id, "none")
-    await update.effective_message.reply_text(
-        "✅ ყველა ინფო და ისტორია წაიშალა. თავიდან ვიწყებთ!"
-    )
+    await update.effective_message.reply_text("✅ ყველა ინფო და ისტორია წაიშალა!")
     await send_onboarding_choice(update)
 
 
@@ -580,15 +570,19 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ჯერ არაფერი შენახული მაქვს.")
         return
     await update.message.reply_text(
-        "✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად.\nახალი ინფოს დასამატებლად უბრალოდ დამიწერე.",
+        "✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად:",
         parse_mode="Markdown",
         reply_markup=edit_list_keyboard(memories),
     )
 
 
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    await do_full_reset(user_id, update)
+    await update.message.reply_text(
+        "⚠️ *დარწმუნებული ხარ?*\n\n"
+        "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+        parse_mode="Markdown",
+        reply_markup=confirm_reset_keyboard(),
+    )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -622,6 +616,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     await query.answer()
 
+    # ── Reset confirmation ────────────────────────────────────────────────────
+    if data == "confirm_reset":
+        await query.edit_message_text("⏳ იშლება...")
+        await do_full_reset(user_id, update)
+        return
+
+    if data == "cancel_reset":
+        await query.edit_message_text("❌ გაუქმდა. ყველაფერი ისევ ადგილზეა ✅")
+        return
+
     # ── Delete single fact ────────────────────────────────────────────────────
     if data.startswith("del_fact:"):
         mem_key = data[9:]
@@ -642,7 +646,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "start_full":
         set_onboarding_state(user_id, "full")
         await query.edit_message_text(
-            "📋 *სრული კითხვარი*\n\n13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\nდავიწყოთ 👇",
+            "📋 *სრული კითხვარი*\n\n"
+            "13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\n"
+            "დავიწყოთ 👇",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
@@ -728,7 +734,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის."
         else:
             text = "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+        )
         return
 
     if data == "switch_menu":
@@ -740,8 +748,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "forget":
-        await query.edit_message_text("⏳ ყველა ინფო იშლება...")
-        await do_full_reset(user_id, update)
+        await query.edit_message_text(
+            "⚠️ *დარწმუნებული ხარ?*\n\n"
+            "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+            parse_mode="Markdown",
+            reply_markup=confirm_reset_keyboard(),
+        )
         return
 
     if data == "reset":
@@ -770,9 +782,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.from_user.id
     user_text = update.message.text.strip()
 
-    # ── Reset trigger detection ───────────────────────────────────────────────
+    # ── Reset trigger → show confirmation ─────────────────────────────────────
     if user_text.lower() in {t.lower() for t in RESET_TRIGGERS}:
-        await do_full_reset(user_id, update)
+        await update.message.reply_text(
+            "⚠️ *დარწმუნებული ხარ?*\n\n"
+            "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+            parse_mode="Markdown",
+            reply_markup=confirm_reset_keyboard(),
+        )
         return
 
     ob_state = get_onboarding_state(user_id)
@@ -797,7 +814,6 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("memories",  cmd_memories))
@@ -806,12 +822,9 @@ def main():
     app.add_handler(CommandHandler("reset",     cmd_reset))
     app.add_handler(CommandHandler("switch",    cmd_switch))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
-
-    # Callbacks and messages
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily reminder at 09:00
     app.job_queue.run_daily(
         daily_reminder_job,
         time=datetime.strptime("09:00", "%H:%M").time(),
