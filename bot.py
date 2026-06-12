@@ -7,6 +7,9 @@ Georgian Financial Assistant Telegram Bot
 - Text-based reset with confirmation dialog
 - Georgian tax deadline reminders
 - /edit command to edit saved facts
+- PDF/Image document analysis (max 5MB, 10 pages)
+- /export command to export business profile
+- Enhanced auto fact extraction
 - 50-message chat history
 - OpenAI Responses API with File Search (Vector Store)
 
@@ -17,6 +20,7 @@ Environment variables:
 """
 
 import os
+import io
 import sqlite3
 import asyncio
 import logging
@@ -24,7 +28,7 @@ from datetime import datetime, date
 from contextlib import contextmanager
 
 from openai import AsyncOpenAI
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Document, PhotoSize
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -40,11 +44,12 @@ TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
 VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 
-MODEL       = "gpt-4.1-mini"
-MAX_HISTORY = 50
-DB_PATH     = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
+MODEL        = "gpt-4.1-mini"
+MAX_HISTORY  = 50
+DB_PATH      = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
+MAX_FILE_MB  = 5
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 
-# Words that trigger reset confirmation dialog
 RESET_TRIGGERS = {
     "წაშალე", "ყველაფერი წაშალე", "თავიდან დავიწყოთ", "თავიდან",
     "გასუფთავება", "დასუფთავება", "ყველაფერი", "reset", "clear",
@@ -119,8 +124,8 @@ If a concept is unclear to the user and they ask for clarification, explain it
 in very simple terms with a concrete real-life example.
 
 ## MEMORY MANAGEMENT
-When the user shares business facts, extract and save them by adding at the
-END of your response (these lines are hidden from display):
+When the user shares business facts (in ANY message, not just onboarding),
+extract and save them by adding at the END of your response:
 
 SAVE: [short clear fact in English]
 
@@ -133,6 +138,13 @@ SAVE: employees — 3, all on official payroll
 SAVE: VAT registered — no
 SAVE: last declaration — Q3 2024
 SAVE: main expenses — salaries, office rent, marketing
+SAVE: founded — 2022
+SAVE: industry — software development
+
+Always extract facts even from casual conversation. Examples:
+- "ჩვენ 5 თანამშრომელი გვყავს" → SAVE: employees — 5
+- "მე ვარ დირექტორი" → SAVE: owner/director — yes
+- "ბრუნვა გაიზარდა 20,000 ლარამდე" → SAVE: monthly revenue — 20,000 GEL
 
 If the user CORRECTS a previously saved fact:
 UPDATE: [old fact keyword] → [new fact]
@@ -166,6 +178,21 @@ Q1: ბიზნესი რეგისტრირებულია და �
 Q2: ყოველთვიური ბრუნვა დაახლოებით რამდენია?
 Q3: თანამშრომლები გყავს?
 Q4: რა გჭირდება ახლა — გადასახადები, დეკლარაცია, ფინანსური გეგმა, სხვა?
+"""
+
+DOCUMENT_PROMPT = """You are analyzing a document uploaded by a Georgian business owner.
+
+Extract ALL relevant business/financial information from this document and:
+1. Summarize what the document contains in 2-3 sentences
+2. List key financial figures, dates, and facts found
+3. Answer the user's question about the document if they asked one
+4. Save any important business facts using SAVE: format
+
+Always respond in the same language the user writes in.
+Be specific — quote exact numbers, dates, and names from the document.
+
+At the end, save relevant facts:
+SAVE: [fact from document]
 """
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -417,6 +444,68 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
     return extract_and_clean(user_id, raw)
 
 
+async def analyze_document(user_id: int, file_bytes: bytes, mime_type: str, caption: str = "") -> str:
+    """Analyze uploaded document using OpenAI."""
+    import base64
+
+    user_question = caption if caption else "გაანალიზე ეს დოკუმენტი და მითხარი რა შეიცავს."
+
+    memories = load_memories(user_id)
+    memory_block = ""
+    if memories:
+        facts = "\n".join(f"  - {f}" for f in memories)
+        memory_block = f"\n\nClient's saved facts:\n{facts}"
+
+    system_content = DOCUMENT_PROMPT + memory_block
+
+    # Build content based on file type
+    if mime_type in ("image/jpeg", "image/png", "image/webp"):
+        b64 = base64.b64encode(file_bytes).decode()
+        user_content = [
+            {
+                "type": "input_image",
+                "image_url": f"data:{mime_type};base64,{b64}",
+            },
+            {"type": "input_text", "text": user_question},
+        ]
+    else:
+        # PDF or other document — send as file
+        b64 = base64.b64encode(file_bytes).decode()
+        user_content = [
+            {
+                "type": "input_file",
+                "filename": "document.pdf",
+                "file_data": f"data:{mime_type};base64,{b64}",
+            },
+            {"type": "input_text", "text": user_question},
+        ]
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user",   "content": user_content},
+    ]
+
+    response = await client.responses.create(model=MODEL, input=messages)
+    raw      = response.output_text.strip()
+    return extract_and_clean(user_id, raw)
+
+
+# ─── Export helper ────────────────────────────────────────────────────────────
+
+def build_export_text(user_id: int) -> str:
+    facts = load_memories(user_id)
+    if not facts:
+        return ""
+    lines = "\n".join(f"• {f}" for f in facts)
+    now   = datetime.now().strftime("%d.%m.%Y %H:%M")
+    return (
+        f"📋 *ბიზნეს პროფილი*\n"
+        f"_გენერირებულია: {now}_\n\n"
+        f"{lines}\n\n"
+        f"_ეს ინფო შენახულია შენი ბოტის მეხსიერებაში._"
+    )
+
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def main_menu_keyboard():
@@ -430,8 +519,8 @@ def main_menu_keyboard():
             InlineKeyboardButton("📅 ვადები",        callback_data="show_deadlines"),
         ],
         [
+            InlineKeyboardButton("📤 ექსპორტი",     callback_data="export_profile"),
             InlineKeyboardButton("🗑 ინფო წაშლა",   callback_data="forget"),
-            InlineKeyboardButton("🔃 ისტ. წაშლა",   callback_data="reset"),
         ],
     ])
 
@@ -439,7 +528,7 @@ def main_menu_keyboard():
 def confirm_reset_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ კი, წაშალე",  callback_data="confirm_reset"),
+            InlineKeyboardButton("✅ კი, წაშალე",      callback_data="confirm_reset"),
             InlineKeyboardButton("❌ არა, გავაგრძელო", callback_data="cancel_reset"),
         ]
     ])
@@ -463,7 +552,7 @@ def onboarding_keyboard():
 def edit_list_keyboard(memories: list[tuple[str, str]]):
     buttons = []
     for mem_key, fact in memories:
-        label = fact[:40] + ("…" if len(fact) > 40 else "")
+        label = fact[:38] + ("…" if len(fact) > 38 else "")
         buttons.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"del_fact:{mem_key}")])
     buttons.append([InlineKeyboardButton("« უკან", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -540,10 +629,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — მთავარი მენიუ\n"
         "/memories — ჩემი ბიზნეს ინფო\n"
         "/edit — ინფოს რედაქტირება\n"
+        "/export — ბიზნეს პროფილის ექსპორტი\n"
         "/switch — კითხვარის შეცვლა\n"
         "/deadlines — საგადასახადო ვადები\n"
         "/forget — ინფოს წაშლა\n"
         "/reset — საუბრის ისტორიის წაშლა\n\n"
+        "📎 *დოკუმენტები:*\n"
+        "გამომიგზავნე PDF, Word ან ფოტო (მაქს. 5MB)\n"
+        "დავანალიზებ და ინფოს ამოვიღებ!\n\n"
         "💡 ნებისმიერ დროს შეგიძლია კითხვა დამისვა!",
         parse_mode="Markdown",
     )
@@ -576,10 +669,18 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text    = build_export_text(user_id)
+    if not text:
+        await update.message.reply_text("ჯერ არაფერი შენახული მაქვს.")
+        return
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚠️ *დარწმუნებული ხარ?*\n\n"
-        "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+        "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
         parse_mode="Markdown",
         reply_markup=confirm_reset_keyboard(),
     )
@@ -608,6 +709,82 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="Markdown")
 
 
+# ─── Document handler ─────────────────────────────────────────────────────────
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    caption = update.message.caption or ""
+
+    ob_state = get_onboarding_state(user_id)
+    if ob_state == "none":
+        await send_onboarding_choice(update)
+        return
+
+    # Determine file type and get file object
+    if update.message.document:
+        doc       = update.message.document
+        mime_type = doc.mime_type or "application/octet-stream"
+        file_size = doc.file_size or 0
+        file_obj  = doc
+
+        allowed_mimes = (
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "image/jpeg", "image/png", "image/webp",
+        )
+        if mime_type not in allowed_mimes:
+            await update.message.reply_text(
+                "❌ ეს ფაილის ტიპი არ არის მხარდაჭერილი.\n\n"
+                "გამომიგზავნე: PDF, Word (.docx), ან ფოტო (JPG/PNG)"
+            )
+            return
+
+    elif update.message.photo:
+        photo     = update.message.photo[-1]  # highest resolution
+        file_size = photo.file_size or 0
+        mime_type = "image/jpeg"
+        file_obj  = photo
+    else:
+        return
+
+    # Check file size
+    if file_size > MAX_FILE_BYTES:
+        await update.message.reply_text(
+            f"❌ ფაილი ძალიან დიდია ({file_size // (1024*1024):.1f}MB).\n"
+            f"მაქსიმუმი: {MAX_FILE_MB}MB"
+        )
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    await update.message.reply_text("📄 ვკითხულობ დოკუმენტს...")
+
+    try:
+        tg_file    = await context.bot.get_file(file_obj.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        file_bytes = bytes(file_bytes)
+    except Exception as e:
+        log.error("File download error [%s]: %s", user_id, e)
+        await update.message.reply_text("❌ ფაილის ჩამოტვირთვა ვერ მოხერხდა.")
+        return
+
+    try:
+        reply = await analyze_document(user_id, file_bytes, mime_type, caption)
+    except Exception as e:
+        log.error("Document analysis error [%s]: %s", user_id, e)
+        await update.message.reply_text("❌ დოკუმენტის ანალიზი ვერ მოხერხდა. სცადე თავიდან.")
+        return
+
+    save_message(user_id, "user", f"[დოკუმენტი] {caption}")
+    save_message(user_id, "assistant", reply)
+
+    ob_state = get_onboarding_state(user_id)
+    if ob_state == "done":
+        await update.message.reply_text(reply, reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text(reply)
+
+
 # ─── Callback query handler ───────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -616,7 +793,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     await query.answer()
 
-    # ── Reset confirmation ────────────────────────────────────────────────────
     if data == "confirm_reset":
         await query.edit_message_text("⏳ იშლება...")
         await do_full_reset(user_id, update)
@@ -626,7 +802,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ გაუქმდა. ყველაფერი ისევ ადგილზეა ✅")
         return
 
-    # ── Delete single fact ────────────────────────────────────────────────────
     if data.startswith("del_fact:"):
         mem_key = data[9:]
         delete_memory_by_key(user_id, mem_key)
@@ -642,13 +817,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ── Onboarding start ──────────────────────────────────────────────────────
     if data == "start_full":
         set_onboarding_state(user_id, "full")
         await query.edit_message_text(
-            "📋 *სრული კითხვარი*\n\n"
-            "13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\n"
-            "დავიწყოთ 👇",
+            "📋 *სრული კითხვარი*\n\n13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\nდავიწყოთ 👇",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
@@ -671,7 +843,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Switch mode ───────────────────────────────────────────────────────────
     if data == "switch_full":
         set_onboarding_state(user_id, "full")
         clear_history(user_id)
@@ -702,7 +873,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Menu actions ──────────────────────────────────────────────────────────
     if data == "show_memories":
         facts = load_memories(user_id)
         if not facts:
@@ -728,12 +898,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if data == "export_profile":
+        text = build_export_text(user_id)
+        if not text:
+            await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
+        else:
+            await query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+            )
+        return
+
     if data == "show_deadlines":
         deadlines = get_upcoming_deadlines(days_ahead=30)
-        if not deadlines:
-            text = "✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის."
-        else:
-            text = "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
+        text = (
+            "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
+            if deadlines else "✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის."
+        )
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
         )
@@ -749,18 +929,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "forget":
         await query.edit_message_text(
-            "⚠️ *დარწმუნებული ხარ?*\n\n"
-            "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+            "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
             parse_mode="Markdown",
             reply_markup=confirm_reset_keyboard(),
-        )
-        return
-
-    if data == "reset":
-        clear_history(user_id)
-        await query.edit_message_text(
-            "✅ საუბრის ისტორია წაიშალა.",
-            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -782,11 +953,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.from_user.id
     user_text = update.message.text.strip()
 
-    # ── Reset trigger → show confirmation ─────────────────────────────────────
     if user_text.lower() in {t.lower() for t in RESET_TRIGGERS}:
         await update.message.reply_text(
-            "⚠️ *დარწმუნებული ხარ?*\n\n"
-            "ყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
+            "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
             parse_mode="Markdown",
             reply_markup=confirm_reset_keyboard(),
         )
@@ -818,11 +987,14 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("memories",  cmd_memories))
     app.add_handler(CommandHandler("edit",      cmd_edit))
+    app.add_handler(CommandHandler("export",    cmd_export))
     app.add_handler(CommandHandler("forget",    cmd_forget))
     app.add_handler(CommandHandler("reset",     cmd_reset))
     app.add_handler(CommandHandler("switch",    cmd_switch))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_daily(
