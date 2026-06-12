@@ -5,10 +5,13 @@ Georgian Financial Assistant Telegram Bot
 - /switch command to change mode without losing data
 - Auto-saves business facts from conversation
 - Text-based reset with confirmation dialog
-- Georgian tax deadline reminders
+- Georgian tax deadline reminders (personalized by tax regime)
 - /edit command to edit saved facts
-- PDF/Image document analysis (max 5MB, 10 pages)
+- PDF/Image/Screenshot document analysis (max 5MB)
+- Voice message transcription and response
+- Monthly financial tracker (/tracker)
 - /export command to export business profile
+- Multi-language support (Georgian/English/Russian)
 - Enhanced auto fact extraction
 - 50-message chat history
 - OpenAI Responses API with File Search (Vector Store)
@@ -20,7 +23,6 @@ Environment variables:
 """
 
 import os
-import io
 import sqlite3
 import asyncio
 import logging
@@ -28,7 +30,7 @@ from datetime import datetime, date
 from contextlib import contextmanager
 
 from openai import AsyncOpenAI
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Document, PhotoSize
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -44,11 +46,10 @@ TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
 VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 
-MODEL        = "gpt-4.1-mini"
-MAX_HISTORY  = 50
-DB_PATH      = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
-MAX_FILE_MB  = 5
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+MODEL          = "gpt-4.1-mini"
+MAX_HISTORY    = 50
+DB_PATH        = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
+MAX_FILE_BYTES = 5 * 1024 * 1024  # 5MB
 
 RESET_TRIGGERS = {
     "წაშალე", "ყველაფერი წაშალე", "თავიდან დავიწყოთ", "თავიდან",
@@ -56,22 +57,42 @@ RESET_TRIGGERS = {
     "სრული წაშლა", "ინფო წაშლა", "ახლიდან", "თავიდან ახლიდან",
 }
 
-# ─── Georgian tax deadlines ───────────────────────────────────────────────────
+# ─── Georgian tax deadlines (personalized) ────────────────────────────────────
 
-def get_upcoming_deadlines(days_ahead: int = 7) -> list[str]:
+def get_upcoming_deadlines(days_ahead: int = 7, tax_regime: str = "") -> list[str]:
     today     = date.today()
     year      = today.year
     deadlines = []
+    regime    = tax_regime.lower()
 
-    for month in [4, 7, 10]:
-        deadlines.append((date(year, month, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
-    deadlines.append((date(year + 1, 1, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
+    # Small business — monthly by 15th
+    if "small business" in regime or "1%" in regime or "მცირე" in regime or not regime:
+        for month in range(1, 13):
+            deadlines.append((
+                date(year, month, 15),
+                "მცირე ბიზნესის ყოველთვიური დეკლარაცია (rs.ge)"
+            ))
 
+    # VAT — monthly by 15th
+    if "vat" in regime or "დღგ" in regime or not regime:
+        for month in range(1, 13):
+            deadlines.append((
+                date(year, month, 15),
+                f"დღგ-ს დეკლარაცია — Form 300 ({month} თვე)"
+            ))
+
+    # Annual income declaration — April 1
+    deadlines.append((date(year, 4, 1), "წლიური საშემოსავლო დეკლარაცია (1 აპრილი)"))
+
+    # SARAS — October 1
+    deadlines.append((date(year, 10, 1), "SARAS ფინანსური ანგარიშგება (1 ოქტომბერი)"))
+
+    # Pension — monthly by 15th
     for month in range(1, 13):
-        deadlines.append((date(year, month, 15), f"დღგ-ს დეკლარაცია ({month} თვე)"))
-
-    deadlines.append((date(year, 4, 1), "წლიური საშემოსავლო გადასახადის დეკლარაცია"))
-    deadlines.append((date(year, 4, 1), "კორპორაციული მოგების გადასახადი"))
+        deadlines.append((
+            date(year, month, 15),
+            f"საპენსიო/ხელფასის დეკლარაცია — Form 200 ({month} თვე)"
+        ))
 
     upcoming = []
     for deadline_date, name in deadlines:
@@ -83,20 +104,37 @@ def get_upcoming_deadlines(days_ahead: int = 7) -> list[str]:
                 upcoming.append(f"🟠 *ხვალ* — {name}")
             else:
                 upcoming.append(f"🟡 *{delta} დღეში* ({deadline_date.strftime('%d.%m')}) — {name}")
-    return upcoming
+
+    # Remove duplicates
+    seen = set()
+    unique = []
+    for item in upcoming:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
 
 
 async def send_reminders(app):
-    deadlines = get_upcoming_deadlines(days_ahead=7)
-    if not deadlines:
-        return
+    """Send personalized reminders based on user's tax regime."""
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT DISTINCT user_id FROM user_state WHERE onboarding='done'"
         ).fetchall()
+
     for row in rows:
         user_id = row[0]
-        text    = "📅 *საგადასახადო შეხსენება*\n\n" + "\n".join(deadlines)
+        # Get user's tax regime from memories
+        with sqlite3.connect(DB_PATH) as conn:
+            mem_row = conn.execute(
+                "SELECT fact FROM memories WHERE user_id=? AND mem_key LIKE '%tax regime%'",
+                (user_id,)
+            ).fetchone()
+        regime    = mem_row[0] if mem_row else ""
+        deadlines = get_upcoming_deadlines(days_ahead=7, tax_regime=regime)
+        if not deadlines:
+            continue
+        text = "📅 *საგადასახადო შეხსენება*\n\n" + "\n".join(deadlines)
         try:
             await app.bot.send_message(user_id, text, parse_mode="Markdown")
         except Exception as e:
@@ -113,19 +151,24 @@ with 20+ years of experience. You help startups and small businesses with:
 - Payroll, HR-related taxes, and salary calculations
 - VAT registration and reporting
 - Investor and bank reporting
+- Step-by-step guidance on rs.ge portal navigation
 
 You have access to uploaded accounting and financial documents via file search.
 You also have access to saved facts about this specific user's business.
 Use both sources to give accurate, personalized advice.
 
-Always respond in the same language the user writes in.
+LANGUAGE RULE: Always respond in the SAME language the user writes in.
+- If user writes in Georgian → respond in Georgian
+- If user writes in English → respond in English
+- If user writes in Russian → respond in Russian
+- Never switch languages unless user explicitly asks
+
 Be professional, warm, and concise. Never be vague — give specific, actionable answers.
 If a concept is unclear to the user and they ask for clarification, explain it
 in very simple terms with a concrete real-life example.
 
 ## MEMORY MANAGEMENT
-When the user shares business facts (in ANY message, not just onboarding),
-extract and save them by adding at the END of your response:
+When the user shares business facts (in ANY message), extract and save them:
 
 SAVE: [short clear fact in English]
 
@@ -138,20 +181,19 @@ SAVE: employees — 3, all on official payroll
 SAVE: VAT registered — no
 SAVE: last declaration — Q3 2024
 SAVE: main expenses — salaries, office rent, marketing
-SAVE: founded — 2022
-SAVE: industry — software development
+SAVE: language preference — Georgian
 
-Always extract facts even from casual conversation. Examples:
+Always extract facts even from casual conversation:
 - "ჩვენ 5 თანამშრომელი გვყავს" → SAVE: employees — 5
-- "მე ვარ დირექტორი" → SAVE: owner/director — yes
-- "ბრუნვა გაიზარდა 20,000 ლარამდე" → SAVE: monthly revenue — 20,000 GEL
+- "I speak English" → SAVE: language preference — English
+- "бизнес в Тбилиси" → SAVE: location — Tbilisi, Georgia
 
 If the user CORRECTS a previously saved fact:
 UPDATE: [old fact keyword] → [new fact]
 
 ## ⚠️ CRITICAL ONBOARDING RULES
 RULE 1: Send EXACTLY ONE question per message. ONE. Never two. Never three.
-RULE 2: Do NOT combine questions with "და", "ასევე", "გარდა ამისა", "and", "also".
+RULE 2: Do NOT combine questions with "და", "ასევე", "and", "also", "также".
 RULE 3: Count the "?" marks in your message. If there are 2 or more — rewrite.
 RULE 4: After the user answers, write SAVE: for that fact, then ask the NEXT single question.
 RULE 5: If user asks for clarification, answer it, then ask the SAME question again.
@@ -180,18 +222,25 @@ Q3: თანამშრომლები გყავს?
 Q4: რა გჭირდება ახლა — გადასახადები, დეკლარაცია, ფინანსური გეგმა, სხვა?
 """
 
-DOCUMENT_PROMPT = """You are analyzing a document uploaded by a Georgian business owner.
+DOCUMENT_PROMPT = """You are analyzing a document or screenshot uploaded by a Georgian business owner.
 
-Extract ALL relevant business/financial information from this document and:
-1. Summarize what the document contains in 2-3 sentences
-2. List key financial figures, dates, and facts found
-3. Answer the user's question about the document if they asked one
-4. Save any important business facts using SAVE: format
+This might be:
+- A screenshot of rs.ge portal - guide them through what to do next
+- A financial document - extract key figures and facts
+- A tax declaration form - analyze and advise
+- Any other business document
 
-Always respond in the same language the user writes in.
-Be specific — quote exact numbers, dates, and names from the document.
+Tasks:
+1. Identify what the document/screenshot shows
+2. Extract ALL relevant financial figures, dates, and facts
+3. If it's a portal screenshot, give specific next-step instructions
+4. Answer the user's question if they asked one
+5. Save important facts using SAVE: format
 
-At the end, save relevant facts:
+LANGUAGE: Respond in the same language as the user's caption or previous messages.
+Be specific — reference exact numbers, buttons, and field names visible in the document.
+
+At the end save relevant facts:
 SAVE: [fact from document]
 """
 
@@ -220,7 +269,20 @@ def init_db():
                 onboarding TEXT    DEFAULT 'none',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
+            CREATE TABLE IF NOT EXISTS monthly_tracker (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                year       INTEGER NOT NULL,
+                month      INTEGER NOT NULL,
+                income     REAL    DEFAULT 0,
+                expenses   REAL    DEFAULT 0,
+                tax        REAL    DEFAULT 0,
+                notes      TEXT    DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, year, month)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_user    ON conversations(user_id);
+            CREATE INDEX IF NOT EXISTS idx_tracker_user ON monthly_tracker(user_id);
         """)
 
         db.execute("""
@@ -310,6 +372,15 @@ def load_memories_with_keys(user_id: int) -> list[tuple[str, str]]:
     return [(row["mem_key"], row["fact"]) for row in rows]
 
 
+def get_tax_regime(user_id: int) -> str:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT fact FROM memories WHERE user_id=? AND mem_key LIKE '%tax%regime%'",
+            (user_id,)
+        ).fetchone()
+    return row["fact"] if row else ""
+
+
 def save_memory(user_id: int, fact: str):
     fact    = fact.strip()
     mem_key = fact.split(" — ")[0].strip().lower() if " — " in fact else fact[:40].lower()
@@ -336,6 +407,44 @@ def update_memory(user_id: int, old_keyword: str, new_fact: str):
 def clear_memories(user_id: int):
     with get_db() as db:
         db.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
+
+
+# ─── Monthly tracker helpers ──────────────────────────────────────────────────
+
+def get_tracker_entry(user_id: int, year: int, month: int) -> dict:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM monthly_tracker WHERE user_id=? AND year=? AND month=?",
+            (user_id, year, month)
+        ).fetchone()
+    if row:
+        return dict(row)
+    return {"income": 0, "expenses": 0, "tax": 0, "notes": ""}
+
+
+def save_tracker_entry(user_id: int, year: int, month: int,
+                       income: float, expenses: float, tax: float, notes: str = ""):
+    with get_db() as db:
+        db.execute(
+            """INSERT INTO monthly_tracker(user_id, year, month, income, expenses, tax, notes, updated_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(user_id, year, month) DO UPDATE SET
+                   income=excluded.income, expenses=excluded.expenses,
+                   tax=excluded.tax, notes=excluded.notes,
+                   updated_at=excluded.updated_at""",
+            (user_id, year, month, income, expenses, tax, notes)
+        )
+
+
+def get_tracker_summary(user_id: int, months: int = 6) -> list[dict]:
+    with get_db() as db:
+        rows = db.execute(
+            """SELECT year, month, income, expenses, tax, notes
+               FROM monthly_tracker WHERE user_id=?
+               ORDER BY year DESC, month DESC LIMIT ?""",
+            (user_id, months)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ─── Conversation helpers ─────────────────────────────────────────────────────
@@ -422,7 +531,7 @@ def build_messages(user_id: int, user_text: str, mode: str = "chat") -> list[dic
     return [system] + history + [new_msg]
 
 
-# ─── OpenAI call ──────────────────────────────────────────────────────────────
+# ─── OpenAI calls ─────────────────────────────────────────────────────────────
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 _locks: dict[int, asyncio.Lock] = {}
@@ -440,16 +549,23 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
     if VECTOR_STORE_ID:
         kwargs["tools"] = [{"type": "file_search", "vector_store_ids": [VECTOR_STORE_ID]}]
     response = await client.responses.create(**kwargs)
-    raw      = response.output_text.strip()
-    return extract_and_clean(user_id, raw)
+    return extract_and_clean(user_id, response.output_text.strip())
+
+
+async def transcribe_voice(file_bytes: bytes) -> str:
+    """Transcribe voice message using OpenAI Whisper."""
+    import io
+    audio_file = io.BytesIO(file_bytes)
+    audio_file.name = "voice.ogg"
+    result = await client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+    )
+    return result.text
 
 
 async def analyze_document(user_id: int, file_bytes: bytes, mime_type: str, caption: str = "") -> str:
-    """Analyze uploaded document using OpenAI."""
     import base64
-
-    user_question = caption if caption else "გაანალიზე ეს დოკუმენტი და მითხარი რა შეიცავს."
-
     memories = load_memories(user_id)
     memory_block = ""
     if memories:
@@ -457,26 +573,17 @@ async def analyze_document(user_id: int, file_bytes: bytes, mime_type: str, capt
         memory_block = f"\n\nClient's saved facts:\n{facts}"
 
     system_content = DOCUMENT_PROMPT + memory_block
+    user_question  = caption if caption else "გაანალიზე ეს დოკუმენტი/სქრინშოტი და მითხარი რა შეიცავს და რა უნდა გავაკეთო."
+    b64            = base64.b64encode(file_bytes).decode()
 
-    # Build content based on file type
-    if mime_type in ("image/jpeg", "image/png", "image/webp"):
-        b64 = base64.b64encode(file_bytes).decode()
+    if mime_type in ("image/jpeg", "image/png", "image/webp", "image/gif"):
         user_content = [
-            {
-                "type": "input_image",
-                "image_url": f"data:{mime_type};base64,{b64}",
-            },
-            {"type": "input_text", "text": user_question},
+            {"type": "input_image", "image_url": f"data:{mime_type};base64,{b64}"},
+            {"type": "input_text",  "text": user_question},
         ]
     else:
-        # PDF or other document — send as file
-        b64 = base64.b64encode(file_bytes).decode()
         user_content = [
-            {
-                "type": "input_file",
-                "filename": "document.pdf",
-                "file_data": f"data:{mime_type};base64,{b64}",
-            },
+            {"type": "input_file", "filename": "document.pdf", "file_data": f"data:{mime_type};base64,{b64}"},
             {"type": "input_text", "text": user_question},
         ]
 
@@ -484,10 +591,8 @@ async def analyze_document(user_id: int, file_bytes: bytes, mime_type: str, capt
         {"role": "system", "content": system_content},
         {"role": "user",   "content": user_content},
     ]
-
     response = await client.responses.create(model=MODEL, input=messages)
-    raw      = response.output_text.strip()
-    return extract_and_clean(user_id, raw)
+    return extract_and_clean(user_id, response.output_text.strip())
 
 
 # ─── Export helper ────────────────────────────────────────────────────────────
@@ -506,6 +611,27 @@ def build_export_text(user_id: int) -> str:
     )
 
 
+# ─── Tracker keyboard ─────────────────────────────────────────────────────────
+
+def tracker_keyboard(year: int, month: int):
+    month_names = ["იანვ", "თებ", "მარტ", "აპრ", "მაი", "ივნ",
+                   "ივლ", "აგვ", "სექ", "ოქტ", "ნოე", "დეკ"]
+    prev_month = month - 1 if month > 1 else 12
+    prev_year  = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year  = year if month < 12 else year + 1
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"◀ {month_names[prev_month-1]}", callback_data=f"tracker:{prev_year}:{prev_month}"),
+            InlineKeyboardButton(f"{month_names[month-1]} {year}", callback_data="tracker_noop"),
+            InlineKeyboardButton(f"{month_names[next_month-1]} ▶", callback_data=f"tracker:{next_year}:{next_month}"),
+        ],
+        [InlineKeyboardButton("✏️ შეყვანა", callback_data=f"tracker_edit:{year}:{month}")],
+        [InlineKeyboardButton("« მენიუ",    callback_data="back_to_menu")],
+    ])
+
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def main_menu_keyboard():
@@ -515,12 +641,16 @@ def main_menu_keyboard():
             InlineKeyboardButton("✏️ რედაქტირება",  callback_data="edit_memories"),
         ],
         [
-            InlineKeyboardButton("🔄 კითხვარი",     callback_data="switch_menu"),
+            InlineKeyboardButton("📊 ტრეკერი",      callback_data="show_tracker"),
             InlineKeyboardButton("📅 ვადები",        callback_data="show_deadlines"),
         ],
         [
+            InlineKeyboardButton("🔄 კითხვარი",     callback_data="switch_menu"),
             InlineKeyboardButton("📤 ექსპორტი",     callback_data="export_profile"),
+        ],
+        [
             InlineKeyboardButton("🗑 ინფო წაშლა",   callback_data="forget"),
+            InlineKeyboardButton("🔃 ისტ. წაშლა",   callback_data="reset"),
         ],
     ])
 
@@ -582,6 +712,25 @@ async def do_full_reset(user_id: int, update: Update):
     await send_onboarding_choice(update)
 
 
+def format_tracker_text(user_id: int, year: int, month: int) -> str:
+    month_names = ["იანვარი", "თებერვალი", "მარტი", "აპრილი", "მაისი", "ივნისი",
+                   "ივლისი", "აგვისტო", "სექტემბერი", "ოქტომბერი", "ნოემბერი", "დეკემბერი"]
+    entry  = get_tracker_entry(user_id, year, month)
+    profit = entry["income"] - entry["expenses"] - entry["tax"]
+
+    text = (
+        f"📊 *{month_names[month-1]} {year}*\n\n"
+        f"💚 შემოსავალი: *{entry['income']:,.2f} ₾*\n"
+        f"🔴 ხარჯი: *{entry['expenses']:,.2f} ₾*\n"
+        f"🟡 გადასახადი: *{entry['tax']:,.2f} ₾*\n"
+        f"────────────────\n"
+        f"💵 მოგება: *{profit:,.2f} ₾*\n"
+    )
+    if entry.get("notes"):
+        text += f"\n📝 {entry['notes']}"
+    return text
+
+
 async def run_ai_and_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -630,13 +779,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/memories — ჩემი ბიზნეს ინფო\n"
         "/edit — ინფოს რედაქტირება\n"
         "/export — ბიზნეს პროფილის ექსპორტი\n"
+        "/tracker — ყოველთვიური ფინანსური ტრეკერი\n"
         "/switch — კითხვარის შეცვლა\n"
         "/deadlines — საგადასახადო ვადები\n"
         "/forget — ინფოს წაშლა\n"
         "/reset — საუბრის ისტორიის წაშლა\n\n"
-        "📎 *დოკუმენტები:*\n"
-        "გამომიგზავნე PDF, Word ან ფოტო (მაქს. 5MB)\n"
-        "დავანალიზებ და ინფოს ამოვიღებ!\n\n"
+        "📎 *ფაილები და სქრინშოტები:*\n"
+        "გამომიგზავნე PDF, Word, ფოტო ან rs.ge სქრინშოტი (მაქს. 5MB)\n\n"
+        "🎤 *ხმოვანი:*\n"
+        "გამომიგზავნე ხმოვანი შეტყობინება — ვისმენ და ვპასუხობ\n\n"
         "💡 ნებისმიერ დროს შეგიძლია კითხვა დამისვა!",
         parse_mode="Markdown",
     )
@@ -678,6 +829,17 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
+async def cmd_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    now     = datetime.now()
+    text    = format_tracker_text(user_id, now.year, now.month)
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=tracker_keyboard(now.year, now.month),
+    )
+
+
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
@@ -701,7 +863,9 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    deadlines = get_upcoming_deadlines(days_ahead=30)
+    user_id   = update.message.from_user.id
+    regime    = get_tax_regime(user_id)
+    deadlines = get_upcoming_deadlines(days_ahead=30, tax_regime=regime)
     if not deadlines:
         await update.message.reply_text("✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის.")
     else:
@@ -712,77 +876,93 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Document handler ─────────────────────────────────────────────────────────
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    caption = update.message.caption or ""
-
+    user_id  = update.message.from_user.id
+    caption  = update.message.caption or ""
     ob_state = get_onboarding_state(user_id)
+
     if ob_state == "none":
         await send_onboarding_choice(update)
         return
 
-    # Determine file type and get file object
     if update.message.document:
         doc       = update.message.document
         mime_type = doc.mime_type or "application/octet-stream"
         file_size = doc.file_size or 0
         file_obj  = doc
-
-        allowed_mimes = (
+        allowed   = (
             "application/pdf",
             "application/msword",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "image/jpeg", "image/png", "image/webp",
         )
-        if mime_type not in allowed_mimes:
+        if mime_type not in allowed:
             await update.message.reply_text(
                 "❌ ეს ფაილის ტიპი არ არის მხარდაჭერილი.\n\n"
-                "გამომიგზავნე: PDF, Word (.docx), ან ფოტო (JPG/PNG)"
+                "გამომიგზავნე: PDF, Word, JPG/PNG ან სქრინშოტი"
             )
             return
-
     elif update.message.photo:
-        photo     = update.message.photo[-1]  # highest resolution
+        photo     = update.message.photo[-1]
         file_size = photo.file_size or 0
         mime_type = "image/jpeg"
         file_obj  = photo
     else:
         return
 
-    # Check file size
     if file_size > MAX_FILE_BYTES:
         await update.message.reply_text(
-            f"❌ ფაილი ძალიან დიდია ({file_size // (1024*1024):.1f}MB).\n"
-            f"მაქსიმუმი: {MAX_FILE_MB}MB"
+            f"❌ ფაილი ძალიან დიდია.\nმაქსიმუმი: 5MB"
         )
         return
 
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
-    await update.message.reply_text("📄 ვკითხულობ დოკუმენტს...")
+    await update.message.reply_text("📄 ვანალიზებ...")
 
     try:
         tg_file    = await context.bot.get_file(file_obj.file_id)
-        file_bytes = await tg_file.download_as_bytearray()
-        file_bytes = bytes(file_bytes)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        reply      = await analyze_document(user_id, file_bytes, mime_type, caption)
     except Exception as e:
-        log.error("File download error [%s]: %s", user_id, e)
-        await update.message.reply_text("❌ ფაილის ჩამოტვირთვა ვერ მოხერხდა.")
+        log.error("Document error [%s]: %s", user_id, e)
+        await update.message.reply_text("❌ ანალიზი ვერ მოხერხდა. სცადე თავიდან.")
         return
 
-    try:
-        reply = await analyze_document(user_id, file_bytes, mime_type, caption)
-    except Exception as e:
-        log.error("Document analysis error [%s]: %s", user_id, e)
-        await update.message.reply_text("❌ დოკუმენტის ანალიზი ვერ მოხერხდა. სცადე თავიდან.")
-        return
-
-    save_message(user_id, "user", f"[დოკუმენტი] {caption}")
+    save_message(user_id, "user", f"[დოკუმენტი/სქრინშოტი] {caption}")
     save_message(user_id, "assistant", reply)
 
-    ob_state = get_onboarding_state(user_id)
-    if ob_state == "done":
+    if get_onboarding_state(user_id) == "done":
         await update.message.reply_text(reply, reply_markup=main_menu_keyboard())
     else:
         await update.message.reply_text(reply)
+
+
+# ─── Voice handler ────────────────────────────────────────────────────────────
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id  = update.message.from_user.id
+    ob_state = get_onboarding_state(user_id)
+
+    if ob_state == "none":
+        await send_onboarding_choice(update)
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    await update.message.reply_text("🎤 ვისმენ...")
+
+    try:
+        voice      = update.message.voice
+        tg_file    = await context.bot.get_file(voice.file_id)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        text       = await transcribe_voice(file_bytes)
+    except Exception as e:
+        log.error("Voice error [%s]: %s", user_id, e)
+        await update.message.reply_text("❌ ხმოვანი შეტყობინება ვერ მოვისმინე. სცადე თავიდან.")
+        return
+
+    await update.message.reply_text(f"🗣 *შენ:* _{text}_", parse_mode="Markdown")
+
+    mode = ob_state if ob_state in ("full", "quick") else "chat"
+    await run_ai_and_reply(update, context, user_id, text, mode=mode)
 
 
 # ─── Callback query handler ───────────────────────────────────────────────────
@@ -793,6 +973,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     await query.answer()
 
+    # ── Reset ─────────────────────────────────────────────────────────────────
     if data == "confirm_reset":
         await query.edit_message_text("⏳ იშლება...")
         await do_full_reset(user_id, update)
@@ -802,8 +983,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ გაუქმდა. ყველაფერი ისევ ადგილზეა ✅")
         return
 
+    # ── Edit fact ─────────────────────────────────────────────────────────────
     if data.startswith("del_fact:"):
-        mem_key = data[9:]
+        mem_key  = data[9:]
         delete_memory_by_key(user_id, mem_key)
         memories = load_memories_with_keys(user_id)
         if not memories:
@@ -817,6 +999,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ── Tracker ───────────────────────────────────────────────────────────────
+    if data == "show_tracker":
+        now  = datetime.now()
+        text = format_tracker_text(user_id, now.year, now.month)
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=tracker_keyboard(now.year, now.month)
+        )
+        return
+
+    if data.startswith("tracker:"):
+        _, year, month = data.split(":")
+        text = format_tracker_text(user_id, int(year), int(month))
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=tracker_keyboard(int(year), int(month))
+        )
+        return
+
+    if data == "tracker_noop":
+        return
+
+    if data.startswith("tracker_edit:"):
+        _, year, month = data.split(":")
+        month_names = ["იანვარი", "თებერვალი", "მარტი", "აპრილი", "მაისი", "ივნისი",
+                       "ივლისი", "აგვისტო", "სექტემბერი", "ოქტომბერი", "ნოემბერი", "დეკემბერი"]
+        context.user_data["tracker_edit"] = {"year": int(year), "month": int(month), "step": "income"}
+        await query.edit_message_text(
+            f"✏️ *{month_names[int(month)-1]} {year} — შეყვანა*\n\n"
+            f"შემოსავალი რამდენი იყო? (ლარში, მხოლოდ რიცხვი)\n"
+            f"მაგ: `5000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Onboarding ────────────────────────────────────────────────────────────
     if data == "start_full":
         set_onboarding_state(user_id, "full")
         await query.edit_message_text(
@@ -843,47 +1061,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Switch ────────────────────────────────────────────────────────────────
     if data == "switch_full":
         set_onboarding_state(user_id, "full")
         clear_history(user_id)
-        await query.edit_message_text(
-            "📋 *სრულ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅",
-            parse_mode="Markdown",
-        )
-        await run_ai_and_reply(
-            update, context, user_id,
-            "User switched to detailed onboarding. Previous facts are saved. "
-            "Ask the next missing question only. ONE question.",
-            mode="full", save_user_msg=False,
-        )
+        await query.edit_message_text("📋 *სრულ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅", parse_mode="Markdown")
+        await run_ai_and_reply(update, context, user_id,
+            "User switched to detailed onboarding. Previous facts are saved. Ask the next missing question only. ONE question.",
+            mode="full", save_user_msg=False)
         return
 
     if data == "switch_quick":
         set_onboarding_state(user_id, "quick")
         clear_history(user_id)
-        await query.edit_message_text(
-            "⚡ *სწრაფ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅",
-            parse_mode="Markdown",
-        )
-        await run_ai_and_reply(
-            update, context, user_id,
-            "User switched to quick onboarding. Previous facts are saved. "
-            "Ask the next missing question only. ONE question.",
-            mode="quick", save_user_msg=False,
-        )
+        await query.edit_message_text("⚡ *სწრაფ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅", parse_mode="Markdown")
+        await run_ai_and_reply(update, context, user_id,
+            "User switched to quick onboarding. Previous facts are saved. Ask the next missing question only. ONE question.",
+            mode="quick", save_user_msg=False)
         return
 
+    # ── Menu ──────────────────────────────────────────────────────────────────
     if data == "show_memories":
         facts = load_memories(user_id)
         if not facts:
             await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
         else:
             lines = "\n".join(f"• {f}" for f in facts)
-            await query.edit_message_text(
-                f"📋 *შენი ბიზნეს ინფო:*\n\n{lines}",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard(),
-            )
+            await query.edit_message_text(f"📋 *შენი ბიზნეს ინფო:*\n\n{lines}", parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
     if data == "edit_memories":
@@ -891,11 +1095,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not memories:
             await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
         else:
-            await query.edit_message_text(
-                "✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად:",
-                parse_mode="Markdown",
-                reply_markup=edit_list_keyboard(memories),
-            )
+            await query.edit_message_text("✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად:", parse_mode="Markdown", reply_markup=edit_list_keyboard(memories))
         return
 
     if data == "export_profile":
@@ -903,45 +1103,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
         else:
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-            )
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
     if data == "show_deadlines":
-        deadlines = get_upcoming_deadlines(days_ahead=30)
-        text = (
-            "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
-            if deadlines else "✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის."
-        )
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-        )
+        regime    = get_tax_regime(user_id)
+        deadlines = get_upcoming_deadlines(days_ahead=30, tax_regime=regime)
+        text      = ("📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)) if deadlines else "✅ მომავალ 30 დღეში ვადები არ არის."
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return
 
     if data == "switch_menu":
-        await query.edit_message_text(
-            "🔄 *კითხვარის შეცვლა*\n\nშენი შენახული ინფო *არ წაიშლება*.",
-            parse_mode="Markdown",
-            reply_markup=switch_keyboard(),
-        )
+        await query.edit_message_text("🔄 *კითხვარის შეცვლა*\n\nშენი შენახული ინფო *არ წაიშლება*.", parse_mode="Markdown", reply_markup=switch_keyboard())
         return
 
     if data == "forget":
-        await query.edit_message_text(
-            "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
-            parse_mode="Markdown",
-            reply_markup=confirm_reset_keyboard(),
-        )
+        await query.edit_message_text("⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო წაიშლება.", parse_mode="Markdown", reply_markup=confirm_reset_keyboard())
+        return
+
+    if data == "reset":
+        clear_history(user_id)
+        await query.edit_message_text("✅ საუბრის ისტორია წაიშალა.", reply_markup=main_menu_keyboard())
         return
 
     if data == "back_to_menu":
         ob_state = get_onboarding_state(user_id)
         if ob_state == "done":
-            await query.edit_message_text(
-                "რით შეგიძლია დაგეხმარო?",
-                reply_markup=main_menu_keyboard(),
-            )
+            await query.edit_message_text("რით შეგიძლია დაგეხმარო?", reply_markup=main_menu_keyboard())
         else:
             await send_onboarding_choice(update, edit=True)
         return
@@ -953,6 +1141,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.from_user.id
     user_text = update.message.text.strip()
 
+    # ── Tracker data entry ────────────────────────────────────────────────────
+    tracker_edit = context.user_data.get("tracker_edit")
+    if tracker_edit:
+        step = tracker_edit.get("step")
+        year = tracker_edit["year"]
+        month = tracker_edit["month"]
+
+        try:
+            value = float(user_text.replace(",", ".").replace(" ", ""))
+        except ValueError:
+            await update.message.reply_text("❌ მხოლოდ რიცხვი ჩაწერე, მაგ: `5000`", parse_mode="Markdown")
+            return
+
+        if step == "income":
+            tracker_edit["income"] = value
+            tracker_edit["step"]   = "expenses"
+            context.user_data["tracker_edit"] = tracker_edit
+            await update.message.reply_text("ხარჯი რამდენი იყო? (ლარში)\nმაგ: `2000`", parse_mode="Markdown")
+        elif step == "expenses":
+            tracker_edit["expenses"] = value
+            tracker_edit["step"]     = "tax"
+            context.user_data["tracker_edit"] = tracker_edit
+            await update.message.reply_text("გადასახადი რამდენი გადაიხადე? (ლარში)\nმაგ: `50`", parse_mode="Markdown")
+        elif step == "tax":
+            save_tracker_entry(
+                user_id, year, month,
+                tracker_edit.get("income", 0),
+                tracker_edit.get("expenses", 0),
+                value,
+            )
+            context.user_data.pop("tracker_edit", None)
+            text = format_tracker_text(user_id, year, month)
+            await update.message.reply_text(
+                f"✅ შენახულია!\n\n{text}",
+                parse_mode="Markdown",
+                reply_markup=tracker_keyboard(year, month),
+            )
+        return
+
+    # ── Reset trigger ─────────────────────────────────────────────────────────
     if user_text.lower() in {t.lower() for t in RESET_TRIGGERS}:
         await update.message.reply_text(
             "⚠️ *დარწმუნებული ხარ?*\n\nყველა შენახული ინფო და საუბრის ისტორია წაიშლება.",
@@ -988,13 +1216,15 @@ def main():
     app.add_handler(CommandHandler("memories",  cmd_memories))
     app.add_handler(CommandHandler("edit",      cmd_edit))
     app.add_handler(CommandHandler("export",    cmd_export))
+    app.add_handler(CommandHandler("tracker",   cmd_tracker))
     app.add_handler(CommandHandler("forget",    cmd_forget))
     app.add_handler(CommandHandler("reset",     cmd_reset))
     app.add_handler(CommandHandler("switch",    cmd_switch))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_document))
+    app.add_handler(MessageHandler(filters.VOICE,                   handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_daily(
