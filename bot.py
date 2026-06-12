@@ -166,6 +166,12 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_conv_user   ON conversations(user_id);
             CREATE INDEX IF NOT EXISTS idx_memory_user ON memories(user_id);
         """)
+        # Migration: add 'key' column if old DB exists without it
+        try:
+            db.execute("ALTER TABLE memories ADD COLUMN key TEXT NOT NULL DEFAULT ''")
+            log.info("Migration: added 'key' column to memories")
+        except Exception:
+            pass  # column already exists, fine
     log.info("DB ready at %s", DB_PATH)
 
 
@@ -244,7 +250,7 @@ def update_memory(user_id: int, old_keyword: str, new_fact: str):
             "INSERT INTO memories(user_id, key, fact) VALUES(?, ?, ?)",
             (user_id, new_key, new_fact)
         )
-    log.info("Memory updated [%s]: %s → %s", user_id, old_keyword, new_fact)
+    log.info("Memory updated [%s]: %s -> %s", user_id, old_keyword, new_fact)
 
 
 def clear_memories(user_id: int):
@@ -299,7 +305,10 @@ def extract_and_clean(user_id: int, raw_text: str) -> str:
                 save_memory(user_id, fact)
         elif s.startswith("UPDATE:"):
             payload = s[7:].strip()
-            if " → " in payload:
+            if " -> " in payload:
+                old_part, new_part = payload.split(" -> ", 1)
+                update_memory(user_id, old_part.strip(), new_part.strip())
+            elif " → " in payload:
                 old_part, new_part = payload.split(" → ", 1)
                 update_memory(user_id, old_part.strip(), new_part.strip())
         elif s == "ONBOARDING_COMPLETE":
@@ -478,7 +487,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Onboarding mode selection ─────────────────────────────────────────────
     if user_text in ("📋 სრული კითხვარი", "სრული კითხვარი", "სრული", "detailed"):
         set_onboarding_state(user_id, "full")
-        await update.message.reply_text(ONBOARDING_INTRO_FULL, reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            ONBOARDING_INTRO_FULL, reply_markup=ReplyKeyboardRemove()
+        )
         await _run_ai_and_reply(
             update, context, user_id,
             "Start the detailed onboarding now. Ask the first question only.",
@@ -488,7 +499,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_text in ("⚡ სწრაფი კითხვარი", "სწრაფი კითხვარი", "სწრაფი", "quick"):
         set_onboarding_state(user_id, "quick")
-        await update.message.reply_text(ONBOARDING_INTRO_QUICK, reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            ONBOARDING_INTRO_QUICK, reply_markup=ReplyKeyboardRemove()
+        )
         await _run_ai_and_reply(
             update, context, user_id,
             "Start the quick onboarding now. Ask the first question only.",
