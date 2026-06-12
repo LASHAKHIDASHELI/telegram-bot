@@ -8,7 +8,6 @@ Georgian Financial Assistant Telegram Bot
 - Georgian tax deadline reminders (personalized by tax regime)
 - /edit command to edit saved facts
 - Monthly financial tracker (/tracker)
-- /export command to export business profile
 - Multi-language support (Georgian/English/Russian)
 - Enhanced auto fact extraction
 - 50-message chat history
@@ -530,20 +529,6 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
 
 # ─── Export helper ────────────────────────────────────────────────────────────
 
-def build_export_text(user_id: int) -> str:
-    facts = load_memories(user_id)
-    if not facts:
-        return ""
-    lines = "\n".join(f"• {f}" for f in facts)
-    now   = datetime.now().strftime("%d.%m.%Y %H:%M")
-    return (
-        f"📋 *ბიზნეს პროფილი*\n"
-        f"_გენერირებულია: {now}_\n\n"
-        f"{lines}\n\n"
-        f"_ეს ინფო შენახულია შენი ბოტის მეხსიერებაში._"
-    )
-
-
 # ─── Tracker keyboard ─────────────────────────────────────────────────────────
 
 def tracker_keyboard(year: int, month: int):
@@ -579,7 +564,6 @@ def main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🔄 კითხვარი",     callback_data="switch_menu"),
-            InlineKeyboardButton("📤 ექსპორტი",     callback_data="export_profile"),
         ],
         [
             InlineKeyboardButton("🗑 ინფო წაშლა",   callback_data="forget"),
@@ -711,7 +695,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — მთავარი მენიუ\n"
         "/memories — ჩემი ბიზნეს ინფო\n"
         "/edit — ინფოს რედაქტირება\n"
-        "/export — ბიზნეს პროფილის ექსპორტი\n"
         "/tracker — ყოველთვიური ფინანსური ტრეკერი\n"
         "/switch — კითხვარის შეცვლა\n"
         "/deadlines — საგადასახადო ვადები\n"
@@ -749,15 +732,6 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=edit_list_keyboard(memories),
     )
-
-
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    text    = build_export_text(user_id)
-    if not text:
-        await update.message.reply_text("ჯერ არაფერი შენახული მაქვს.")
-        return
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 async def cmd_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -941,14 +915,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად:", parse_mode="Markdown", reply_markup=edit_list_keyboard(memories))
         return
 
-    if data == "export_profile":
-        text = build_export_text(user_id)
-        if not text:
-            await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
-        else:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-        return
-
     if data == "show_deadlines":
         regime    = get_tax_regime(user_id)
         deadlines = get_upcoming_deadlines(days_ahead=30, tax_regime=regime)
@@ -1058,7 +1024,6 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("memories",  cmd_memories))
     app.add_handler(CommandHandler("edit",      cmd_edit))
-    app.add_handler(CommandHandler("export",    cmd_export))
     app.add_handler(CommandHandler("tracker",   cmd_tracker))
     app.add_handler(CommandHandler("forget",    cmd_forget))
     app.add_handler(CommandHandler("reset",     cmd_reset))
