@@ -4,6 +4,9 @@ Georgian Financial Assistant Telegram Bot
 - Smart onboarding: detailed (13 questions) or quick (4 questions)
 - /switch command to change mode without losing data
 - Auto-saves business facts from conversation
+- Text-based reset detection
+- Georgian tax deadline reminders
+- /edit command to edit saved facts
 - 50-message chat history
 - OpenAI Responses API with File Search (Vector Store)
 
@@ -17,10 +20,11 @@ import os
 import sqlite3
 import asyncio
 import logging
+from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 
 from openai import AsyncOpenAI
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -39,6 +43,69 @@ VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 MODEL       = "gpt-4.1-mini"
 MAX_HISTORY = 50
 DB_PATH     = "/data/memory.db" if os.path.isdir("/data") else "memory.db"
+
+# Words that trigger instant reset (no AI call needed)
+RESET_TRIGGERS = {
+    "წაშალე", "ყველაფერი წაშალე", "თავიდან დავიწყოთ", "თავიდან",
+    "გასუფთავება", "დასუფთავება", "ყველაფერი", "reset", "clear",
+    "სრული წაშლა", "ინფო წაშლა", "ახლიდან", "თავიდან ახლიდან",
+}
+
+# ─── Georgian tax deadlines ───────────────────────────────────────────────────
+
+def get_upcoming_deadlines(days_ahead: int = 7) -> list[str]:
+    """Return tax deadlines within the next `days_ahead` days."""
+    today    = date.today()
+    upcoming = []
+    year     = today.year
+
+    deadlines = []
+
+    # მცირე ბიზნესი — ყოველი კვარტლის 15
+    for month in [4, 7, 10, 1]:
+        y = year if month != 1 else year + 1
+        deadlines.append((date(y, month, 15), "მცირე ბიზნესის კვარტალური დეკლარაცია"))
+
+    # დღგ — ყოველი თვის 15
+    for month in range(1, 13):
+        deadlines.append((date(year, month, 15), f"დღგ-ს დეკლარაცია ({month} თვე)"))
+
+    # საშემოსავლო — 1 აპრილი
+    deadlines.append((date(year, 4, 1), "წლიური საშემოსავლო გადასახადის დეკლარაცია"))
+
+    # მოგების გადასახადი — 1 აპრილი
+    deadlines.append((date(year, 4, 1), "კორპორაციული მოგების გადასახადი"))
+
+    for deadline_date, name in deadlines:
+        delta = (deadline_date - today).days
+        if 0 <= delta <= days_ahead:
+            if delta == 0:
+                upcoming.append(f"🔴 *დღეს* — {name}")
+            elif delta == 1:
+                upcoming.append(f"🟠 *ხვალ* — {name}")
+            else:
+                upcoming.append(f"🟡 *{delta} დღეში* ({deadline_date.strftime('%d.%m')}) — {name}")
+
+    return upcoming
+
+
+async def send_reminders(app):
+    """Called daily at 9:00 — send deadline reminders to all users."""
+    deadlines = get_upcoming_deadlines(days_ahead=7)
+    if not deadlines:
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT DISTINCT user_id FROM user_state WHERE onboarding='done'").fetchall()
+
+    for row in rows:
+        user_id = row[0]
+        text    = "📅 *საგადასახადო შეხსენება*\n\n" + "\n".join(deadlines)
+        try:
+            await app.bot.send_message(user_id, text, parse_mode="Markdown")
+        except Exception as e:
+            log.warning("Could not send reminder to %s: %s", user_id, e)
+
 
 # ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -220,6 +287,16 @@ def load_memories(user_id: int) -> list[str]:
     return [row["fact"] for row in rows]
 
 
+def load_memories_with_keys(user_id: int) -> list[tuple[str, str]]:
+    """Returns list of (mem_key, fact) tuples."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT mem_key, fact FROM memories WHERE user_id = ? ORDER BY created_at",
+            (user_id,)
+        ).fetchall()
+    return [(row["mem_key"], row["fact"]) for row in rows]
+
+
 def save_memory(user_id: int, fact: str):
     fact    = fact.strip()
     mem_key = fact.split(" — ")[0].strip().lower() if " — " in fact else fact[:40].lower()
@@ -227,6 +304,11 @@ def save_memory(user_id: int, fact: str):
         db.execute("DELETE FROM memories WHERE user_id = ? AND mem_key = ?", (user_id, mem_key))
         db.execute("INSERT INTO memories(user_id, mem_key, fact) VALUES(?, ?, ?)", (user_id, mem_key, fact))
     log.info("Memory saved [%s]: %s", user_id, fact)
+
+
+def delete_memory_by_key(user_id: int, mem_key: str):
+    with get_db() as db:
+        db.execute("DELETE FROM memories WHERE user_id = ? AND mem_key = ?", (user_id, mem_key))
 
 
 def update_memory(user_id: int, old_keyword: str, new_fact: str):
@@ -313,15 +395,13 @@ def build_messages(user_id: int, user_text: str, mode: str = "chat") -> list[dic
     onboarding_note = ""
     if mode == "full":
         onboarding_note = (
-            "\n\n⚠️ You are conducting DETAILED ONBOARDING. "
-            "STRICT RULE: Send ONE question per message. ONE question mark max. "
-            "Do NOT combine questions."
+            "\n\n⚠️ DETAILED ONBOARDING MODE. "
+            "STRICT: ONE question per message. ONE '?' max. No combining."
         )
     elif mode == "quick":
         onboarding_note = (
-            "\n\n⚠️ You are conducting QUICK ONBOARDING. "
-            "STRICT RULE: Send ONE question per message. ONE question mark max. "
-            "Do NOT combine questions."
+            "\n\n⚠️ QUICK ONBOARDING MODE. "
+            "STRICT: ONE question per message. ONE '?' max. No combining."
         )
 
     system  = {"role": "system", "content": SYSTEM_PROMPT + memory_block + onboarding_note}
@@ -355,36 +435,45 @@ async def ask_ai(user_id: int, user_text: str, mode: str = "chat") -> str:
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def main_menu_keyboard():
-    """Inline keyboard shown after onboarding is done."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 ჩემი ინფო", callback_data="show_memories"),
-            InlineKeyboardButton("🔄 კითხვარი", callback_data="switch_menu"),
+            InlineKeyboardButton("📋 ჩემი ინფო",    callback_data="show_memories"),
+            InlineKeyboardButton("✏️ რედაქტირება",   callback_data="edit_memories"),
         ],
         [
-            InlineKeyboardButton("🗑 ინფო წაშლა", callback_data="forget"),
-            InlineKeyboardButton("🔃 ისტორია წაშლა", callback_data="reset"),
+            InlineKeyboardButton("🔄 კითხვარი",      callback_data="switch_menu"),
+            InlineKeyboardButton("📅 ვადები",         callback_data="show_deadlines"),
+        ],
+        [
+            InlineKeyboardButton("🗑 ინფო წაშლა",    callback_data="forget"),
+            InlineKeyboardButton("🔃 ისტ. წაშლა",    callback_data="reset"),
         ],
     ])
 
 
 def switch_keyboard():
-    """Inline keyboard to switch onboarding mode."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📋 სრული კითხვარი (13)", callback_data="switch_full"),
-            InlineKeyboardButton("⚡ სწრაფი კითხვარი (4)", callback_data="switch_quick"),
-        ],
-        [InlineKeyboardButton("« უკან", callback_data="back_to_menu")],
+        [InlineKeyboardButton("📋 სრული კითხვარი (13)", callback_data="switch_full")],
+        [InlineKeyboardButton("⚡ სწრაფი კითხვარი (4)",  callback_data="switch_quick")],
+        [InlineKeyboardButton("« უკან",                  callback_data="back_to_menu")],
     ])
 
 
 def onboarding_keyboard():
-    """Keyboard shown at start to choose onboarding mode."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 სრული კითხვარი — 13 კითხვა", callback_data="start_full")],
         [InlineKeyboardButton("⚡ სწრაფი კითხვარი — 4 კითხვა",  callback_data="start_quick")],
     ])
+
+
+def edit_list_keyboard(memories: list[tuple[str, str]]):
+    """Show each saved fact as a button to delete it."""
+    buttons = []
+    for mem_key, fact in memories:
+        label = fact[:40] + ("…" if len(fact) > 40 else "")
+        buttons.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"del_fact:{mem_key}")])
+    buttons.append([InlineKeyboardButton("« უკან", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -401,6 +490,17 @@ async def send_onboarding_choice(update: Update, edit: bool = False):
         await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     else:
         await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def do_full_reset(user_id: int, update: Update):
+    """Wipe all data and show onboarding choice."""
+    clear_memories(user_id)
+    clear_history(user_id)
+    set_onboarding_state(user_id, "none")
+    await update.effective_message.reply_text(
+        "✅ ყველა ინფო და ისტორია წაიშალა. თავიდან ვიწყებთ!"
+    )
+    await send_onboarding_choice(update)
 
 
 async def run_ai_and_reply(
@@ -449,7 +549,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 *ბრძანებები:*\n\n"
         "/start — მთავარი მენიუ\n"
         "/memories — ჩემი ბიზნეს ინფო\n"
+        "/edit — ინფოს რედაქტირება\n"
         "/switch — კითხვარის შეცვლა\n"
+        "/deadlines — საგადასახადო ვადები\n"
         "/forget — ინფოს წაშლა\n"
         "/reset — საუბრის ისტორიის წაშლა\n\n"
         "💡 ნებისმიერ დროს შეგიძლია კითხვა დამისვა!",
@@ -471,12 +573,22 @@ async def cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id  = update.message.from_user.id
+    memories = load_memories_with_keys(user_id)
+    if not memories:
+        await update.message.reply_text("ჯერ არაფერი შენახული მაქვს.")
+        return
+    await update.message.reply_text(
+        "✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად.\nახალი ინფოს დასამატებლად უბრალოდ დამიწერე.",
+        parse_mode="Markdown",
+        reply_markup=edit_list_keyboard(memories),
+    )
+
+
 async def cmd_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    clear_memories(user_id)
-    set_onboarding_state(user_id, "none")
-    await update.message.reply_text("✅ ყველა შენახული ინფო წაიშალა.")
-    await send_onboarding_choice(update)
+    await do_full_reset(user_id, update)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,12 +599,19 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔄 *კითხვარის შეცვლა*\n\n"
-        "შენი შენახული ინფო *არ წაიშლება*.\n"
-        "მხოლოდ კითხვარის ტიპი იცვლება.",
+        "🔄 *კითხვარის შეცვლა*\n\nშენი შენახული ინფო *არ წაიშლება*.",
         parse_mode="Markdown",
         reply_markup=switch_keyboard(),
     )
+
+
+async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    deadlines = get_upcoming_deadlines(days_ahead=30)
+    if not deadlines:
+        await update.message.reply_text("✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის.")
+    else:
+        text = "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ─── Callback query handler ───────────────────────────────────────────────────
@@ -503,14 +622,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     await query.answer()
 
+    # ── Delete single fact ────────────────────────────────────────────────────
+    if data.startswith("del_fact:"):
+        mem_key = data[9:]
+        delete_memory_by_key(user_id, mem_key)
+        memories = load_memories_with_keys(user_id)
+        if not memories:
+            await query.edit_message_text("✅ ყველა ფაქტი წაიშალა.")
+        else:
+            lines = "\n".join(f"• {f}" for _, f in memories)
+            await query.edit_message_text(
+                f"✅ წაიშალა.\n\n📋 *დარჩენილი ინფო:*\n\n{lines}",
+                parse_mode="Markdown",
+                reply_markup=edit_list_keyboard(memories),
+            )
+        return
+
     # ── Onboarding start ──────────────────────────────────────────────────────
     if data == "start_full":
         set_onboarding_state(user_id, "full")
         await query.edit_message_text(
-            "📋 *სრული კითხვარი*\n\n"
-            "13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n"
-            "თუ კითხვა გაუგებარია, უბრალოდ მკითხე!\n\n"
-            "დავიწყოთ 👇",
+            "📋 *სრული კითხვარი*\n\n13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\nდავიწყოთ 👇",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
@@ -523,9 +655,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "start_quick":
         set_onboarding_state(user_id, "quick")
         await query.edit_message_text(
-            "⚡ *სწრაფი კითხვარი*\n\n"
-            "4 კითხვა — სწრაფი დასაწყისი.\n\n"
-            "დავიწყოთ 👇",
+            "⚡ *სწრაფი კითხვარი*\n\n4 კითხვა — სწრაფი დასაწყისი.\n\nდავიწყოთ 👇",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
@@ -535,20 +665,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Switch mode (keeps memories) ─────────────────────────────────────────
+    # ── Switch mode ───────────────────────────────────────────────────────────
     if data == "switch_full":
         set_onboarding_state(user_id, "full")
         clear_history(user_id)
         await query.edit_message_text(
-            "📋 *სრული კითხვარზე გადავედი*\n\n"
-            "შენი ინფო შენახულია ✅\n"
-            "ახლა დეტალური კითხვებს გავაგრძელებ.",
+            "📋 *სრულ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
             update, context, user_id,
-            "The user switched to detailed onboarding. Their previous facts are saved. "
-            "Continue from where we left off or ask the next missing question. One question only.",
+            "User switched to detailed onboarding. Previous facts are saved. "
+            "Ask the next missing question only. ONE question.",
             mode="full", save_user_msg=False,
         )
         return
@@ -557,15 +685,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_onboarding_state(user_id, "quick")
         clear_history(user_id)
         await query.edit_message_text(
-            "⚡ *სწრაფ კითხვარზე გადავედი*\n\n"
-            "შენი ინფო შენახულია ✅\n"
-            "ახლა სწრაფ კითხვებს გავაგრძელებ.",
+            "⚡ *სწრაფ კითხვარზე გადავედი*\n\nშენი ინფო შენახულია ✅",
             parse_mode="Markdown",
         )
         await run_ai_and_reply(
             update, context, user_id,
-            "The user switched to quick onboarding. Their previous facts are saved. "
-            "Continue from where we left off or ask the next missing question. One question only.",
+            "User switched to quick onboarding. Previous facts are saved. "
+            "Ask the next missing question only. ONE question.",
             mode="quick", save_user_msg=False,
         )
         return
@@ -584,21 +710,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if data == "edit_memories":
+        memories = load_memories_with_keys(user_id)
+        if not memories:
+            await query.edit_message_text("ჯერ არაფერი შენახული მაქვს.")
+        else:
+            await query.edit_message_text(
+                "✏️ *რედაქტირება*\n\nდააჭირე ფაქტს წასაშლელად:",
+                parse_mode="Markdown",
+                reply_markup=edit_list_keyboard(memories),
+            )
+        return
+
+    if data == "show_deadlines":
+        deadlines = get_upcoming_deadlines(days_ahead=30)
+        if not deadlines:
+            text = "✅ მომავალ 30 დღეში საგადასახადო ვადები არ არის."
+        else:
+            text = "📅 *მომავალი საგადასახადო ვადები:*\n\n" + "\n".join(deadlines)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+
     if data == "switch_menu":
         await query.edit_message_text(
-            "🔄 *კითხვარის შეცვლა*\n\n"
-            "შენი შენახული ინფო *არ წაიშლება*.\n"
-            "მხოლოდ კითხვარის ტიპი იცვლება.",
+            "🔄 *კითხვარის შეცვლა*\n\nშენი შენახული ინფო *არ წაიშლება*.",
             parse_mode="Markdown",
             reply_markup=switch_keyboard(),
         )
         return
 
     if data == "forget":
-        clear_memories(user_id)
-        set_onboarding_state(user_id, "none")
-        await query.edit_message_text("✅ ყველა შენახული ინფო წაიშალა.")
-        await send_onboarding_choice(update, edit=False)
+        await query.edit_message_text("⏳ ყველა ინფო იშლება...")
+        await do_full_reset(user_id, update)
         return
 
     if data == "reset":
@@ -626,14 +769,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.message.from_user.id
     user_text = update.message.text.strip()
-    ob_state  = get_onboarding_state(user_id)
 
+    # ── Reset trigger detection ───────────────────────────────────────────────
+    if user_text.lower() in {t.lower() for t in RESET_TRIGGERS}:
+        await do_full_reset(user_id, update)
+        return
+
+    ob_state = get_onboarding_state(user_id)
     if ob_state == "none":
         await send_onboarding_choice(update)
         return
 
     mode = ob_state if ob_state in ("full", "quick") else "chat"
     await run_ai_and_reply(update, context, user_id, user_text, mode=mode)
+
+
+# ─── Daily reminder job ───────────────────────────────────────────────────────
+
+async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    await send_reminders(context.application)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -643,14 +797,26 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("memories", cmd_memories))
-    app.add_handler(CommandHandler("forget",   cmd_forget))
-    app.add_handler(CommandHandler("reset",    cmd_reset))
-    app.add_handler(CommandHandler("switch",   cmd_switch))
+    # Commands
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("memories",  cmd_memories))
+    app.add_handler(CommandHandler("edit",      cmd_edit))
+    app.add_handler(CommandHandler("forget",    cmd_forget))
+    app.add_handler(CommandHandler("reset",     cmd_reset))
+    app.add_handler(CommandHandler("switch",    cmd_switch))
+    app.add_handler(CommandHandler("deadlines", cmd_deadlines))
+
+    # Callbacks and messages
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Daily reminder at 09:00
+    app.job_queue.run_daily(
+        daily_reminder_job,
+        time=datetime.strptime("09:00", "%H:%M").time(),
+        name="daily_reminders",
+    )
 
     log.info("Bot is running.")
     app.run_polling()
