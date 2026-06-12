@@ -139,6 +139,8 @@ log = logging.getLogger(__name__)
 
 def init_db():
     with get_db() as db:
+        # Drop old memories table and recreate with correct schema
+        # This is safe because we rebuild from AI conversations anyway
         db.executescript("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,30 +150,48 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS memories (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                key        TEXT    NOT NULL,
-                fact       TEXT    NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, key) ON CONFLICT REPLACE
-            );
-
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id    INTEGER PRIMARY KEY,
                 onboarding TEXT    DEFAULT 'none',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE INDEX IF NOT EXISTS idx_conv_user   ON conversations(user_id);
-            CREATE INDEX IF NOT EXISTS idx_memory_user ON memories(user_id);
+            CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
         """)
-        # Migration: add 'key' column if old DB exists without it
+
+        # Recreate memories table with correct schema
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS memories_new (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                mem_key    TEXT    NOT NULL,
+                fact       TEXT    NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, mem_key)
+            )
+        """)
+
+        # Migrate old data if memories table exists
         try:
-            db.execute("ALTER TABLE memories ADD COLUMN key TEXT NOT NULL DEFAULT ''")
-            log.info("Migration: added 'key' column to memories")
+            db.execute("""
+                INSERT OR IGNORE INTO memories_new (user_id, mem_key, fact, created_at)
+                SELECT user_id,
+                       COALESCE(NULLIF(TRIM(key), ''), SUBSTR(fact, 1, 40)),
+                       fact,
+                       created_at
+                FROM memories
+            """)
+            db.execute("DROP TABLE memories")
+            db.execute("ALTER TABLE memories_new RENAME TO memories")
+            log.info("Migration: memories table rebuilt")
         except Exception:
-            pass  # column already exists, fine
+            # memories table didn't exist or already migrated
+            db.execute("ALTER TABLE memories_new RENAME TO memories")
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_user ON memories(user_id)
+        """)
+
     log.info("DB ready at %s", DB_PATH)
 
 
@@ -223,16 +243,17 @@ def load_memories(user_id: int) -> list[str]:
 
 
 def save_memory(user_id: int, fact: str):
-    fact = fact.strip()
-    key  = fact.split(" — ")[0].strip().lower() if " — " in fact else fact[:40].lower()
+    fact    = fact.strip()
+    mem_key = fact.split(" — ")[0].strip().lower() if " — " in fact else fact[:40].lower()
     with get_db() as db:
+        # Delete existing entry with same key, then insert fresh
         db.execute(
-            """INSERT INTO memories(user_id, key, fact)
-               VALUES(?, ?, ?)
-               ON CONFLICT(user_id, key) DO UPDATE SET
-                   fact=excluded.fact,
-                   created_at=CURRENT_TIMESTAMP""",
-            (user_id, key, fact)
+            "DELETE FROM memories WHERE user_id = ? AND mem_key = ?",
+            (user_id, mem_key)
+        )
+        db.execute(
+            "INSERT INTO memories(user_id, mem_key, fact) VALUES(?, ?, ?)",
+            (user_id, mem_key, fact)
         )
     log.info("Memory saved [%s]: %s", user_id, fact)
 
@@ -243,11 +264,11 @@ def update_memory(user_id: int, old_keyword: str, new_fact: str):
     new_key  = new_fact.split(" — ")[0].strip().lower() if " — " in new_fact else old_key
     with get_db() as db:
         db.execute(
-            "DELETE FROM memories WHERE user_id = ? AND key = ?",
+            "DELETE FROM memories WHERE user_id = ? AND mem_key = ?",
             (user_id, old_key)
         )
         db.execute(
-            "INSERT INTO memories(user_id, key, fact) VALUES(?, ?, ?)",
+            "INSERT INTO memories(user_id, mem_key, fact) VALUES(?, ?, ?)",
             (user_id, new_key, new_fact)
         )
     log.info("Memory updated [%s]: %s -> %s", user_id, old_keyword, new_fact)
@@ -484,7 +505,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     ob_state  = get_onboarding_state(user_id)
 
-    # ── Onboarding mode selection ─────────────────────────────────────────────
     if user_text in ("📋 სრული კითხვარი", "სრული კითხვარი", "სრული", "detailed"):
         set_onboarding_state(user_id, "full")
         await update.message.reply_text(
@@ -509,12 +529,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── No onboarding chosen yet ──────────────────────────────────────────────
     if ob_state == "none":
         await _offer_onboarding(update)
         return
 
-    # ── Normal chat or onboarding in progress ─────────────────────────────────
     mode = ob_state if ob_state in ("full", "quick") else "chat"
     await _run_ai_and_reply(update, context, user_id, user_text, mode=mode)
 
