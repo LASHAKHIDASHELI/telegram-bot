@@ -251,6 +251,60 @@ Q3: თანამშრომლები გყავს?
 Q4: რა გჭირდება ახლა — გადასახადები, დეკლარაცია, ფინანსური გეგმა, სხვა?
 """
 
+LEARNING_PROMPT = """You are an expert teacher specializing in accounting, Georgian
+tax law, financial analysis, and investments. You are talking with a student or
+accountant who wants to LEARN — not a business owner asking about their own company.
+
+TEACHING STYLE:
+- Use the Socratic method where it helps — ask a guiding question before giving
+  the full answer, so the student thinks first.
+- Always use concrete, real Georgian business examples (company names, GEL
+  amounts, real scenarios) — never abstract or generic examples.
+- Adapt explanation depth to the student's apparent level. If they seem confused,
+  simplify further and use a different angle or analogy.
+- After explaining a concept, offer a short practice exercise and grade their
+  answer when they respond.
+- Be encouraging and patient. Never make the student feel bad for not knowing
+  something — that's why they're learning.
+
+CURRENT TOPIC FOCUS: {topic_label}
+
+LANGUAGE RULE: Always respond in the SAME language the user writes in.
+
+## ⚠️ CRITICAL RULE — RECENT LAW CHANGES (2025-2026)
+Your training knowledge is reliable only up to mid-2024. Whenever a question
+touches a recent change, a new deadline, a new penalty, or "what's new in
+2025/2026":
+1. Check file search results first. If a verified document confirms the
+   answer, use it.
+2. If nothing relevant is found, do NOT invent a plausible-sounding number
+   or rule. Clearly tell the student your base knowledge goes up to mid-2024,
+   give them the stable fundamentals you ARE confident about, and recommend
+   they verify the exact current figure on rs.ge or with a licensed
+   accountant. Admitting uncertainty here is a sign of trustworthiness, not
+   weakness.
+3. Never state a specific new percentage, deadline, or penalty number for
+   2025-2026 unless it came from file search results.
+
+MEMORY: If the student shares facts about their learning level, goals, or
+weak areas, save them:
+SAVE: [short fact in English]
+Example: SAVE: learning level — beginner in bookkeeping
+Example: SAVE: studying for — ACCA F3
+"""
+
+
+# ─── Learning topic labels ─────────────────────────────────────────────────────
+
+LEARNING_TOPICS = {
+    "learn_accounting": "Accounting fundamentals — bookkeeping, double-entry, balance sheet, income statement, depreciation",
+    "learn_tax":         "Georgian tax system — VAT, CIT, Small Business Status, PIT, RS.ge navigation, deadlines and penalties",
+    "learn_finance":     "Financial analysis — ratios, break-even, cash flow, DCF, reading financial statements",
+    "learn_investing":   "Investments and statistics — stocks, bonds, funds, portfolio diversification, basic statistics for finance",
+    "learn_acca":        "ACCA exam preparation — exam structure, study approach, practice questions",
+    "learn_free":        "Open question — the student can ask about anything in accounting, tax, finance, or investments",
+}
+
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -522,6 +576,8 @@ def build_messages(user_id: int, user_text: str, mode: str = "chat") -> list[dic
         memory_block = f"\n\nSaved facts about this client:\n{facts}"
 
     onboarding_note = ""
+    base_prompt = SYSTEM_PROMPT
+
     if mode == "full":
         onboarding_note = (
             "\n\n⚠️ DETAILED ONBOARDING MODE. "
@@ -532,8 +588,12 @@ def build_messages(user_id: int, user_text: str, mode: str = "chat") -> list[dic
             "\n\n⚠️ QUICK ONBOARDING MODE. "
             "STRICT: ONE question per message. ONE '?' max. No combining."
         )
+    elif mode.startswith("learn:"):
+        topic_key   = mode.split(":", 1)[1]
+        topic_label = LEARNING_TOPICS.get(topic_key, LEARNING_TOPICS["learn_free"])
+        base_prompt = LEARNING_PROMPT.format(topic_label=topic_label)
 
-    system  = {"role": "system", "content": SYSTEM_PROMPT + memory_block + onboarding_note}
+    system  = {"role": "system", "content": base_prompt + memory_block + onboarding_note}
     history = load_history(user_id)
     new_msg = {"role": "user", "content": user_text}
     return [system] + history + [new_msg]
@@ -622,10 +682,30 @@ def switch_keyboard():
     ])
 
 
+def role_choice_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏢 ბიზნესის მფლობელი ვარ", callback_data="role_business")],
+        [InlineKeyboardButton("🎓 სტუდენტი / ბუღალტერი ვარ", callback_data="role_student")],
+    ])
+
+
 def onboarding_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 სრული კითხვარი — 13 კითხვა", callback_data="start_full")],
         [InlineKeyboardButton("⚡ სწრაფი კითხვარი — 4 კითხვა",  callback_data="start_quick")],
+        [InlineKeyboardButton("« უკან",                          callback_data="back_to_role")],
+    ])
+
+
+def learning_topic_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 ბუღალტრია — საფუძვლები",      callback_data="learn_accounting")],
+        [InlineKeyboardButton("💰 საგადასახადო სისტემა",         callback_data="learn_tax")],
+        [InlineKeyboardButton("📊 ფინანსური ანალიზი",            callback_data="learn_finance")],
+        [InlineKeyboardButton("📈 ინვესტიციები",                  callback_data="learn_investing")],
+        [InlineKeyboardButton("🎓 ACCA მომზადება",                callback_data="learn_acca")],
+        [InlineKeyboardButton("❓ თავისუფალი კითხვა",             callback_data="learn_free")],
+        [InlineKeyboardButton("« უკან",                           callback_data="back_to_role")],
     ])
 
 
@@ -642,12 +722,38 @@ def edit_list_keyboard(memories: list[tuple[str, str]]):
 
 async def send_onboarding_choice(update: Update, edit: bool = False):
     text = (
-        "👋 გამარჯობა! მე ვარ შენი ფინანსური ასისტენტი.\n\n"
+        "👋 გამარჯობა! მე ვარ ფინანსური და საგადასახადო AI ასისტენტი.\n\n"
+        "ვინ ხარ?\n\n"
+        "🏢 *ბიზნესის მფლობელი* — გეხმარები გადასახადებში, რეჟიმის შერჩევაში, ფინანსურ დაგეგმვაში\n"
+        "🎓 *სტუდენტი/ბუღალტერი* — გასწავლი ბუღალტრიას, გადასახადებს, ფინანსურ ანალიზს"
+    )
+    kb = role_choice_keyboard()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def send_business_choice(update: Update, edit: bool = False):
+    text = (
+        "🏢 *ბიზნესის ონბორდინგი*\n\n"
         "როგორ გინდა დავიწყოთ?\n\n"
         "📋 *სრული კითხვარი* — 13 კითხვა, სრული სურათი\n"
         "⚡ *სწრაფი კითხვარი* — 4 კითხვა, სწრაფი დასაწყისი"
     )
     kb = onboarding_keyboard()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def send_learning_choice(update: Update, edit: bool = False):
+    text = (
+        "🎓 *სასწავლო რეჟიმი*\n\n"
+        "რა გინდა ისწავლო?"
+    )
+    kb = learning_topic_keyboard()
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     else:
@@ -704,6 +810,8 @@ async def run_ai_and_reply(
     ob_state = get_onboarding_state(user_id)
     if ob_state == "done":
         await update.effective_message.reply_text(reply, reply_markup=main_menu_keyboard())
+    elif ob_state.startswith("learn:"):
+        await update.effective_message.reply_text(reply, reply_markup=learning_topic_keyboard())
     else:
         await update.effective_message.reply_text(reply)
 
@@ -717,6 +825,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "კვლავ გამარჯობა! 👋 შენი ბიზნეს ინფო შენახული მაქვს.\n\nრით შეგიძლია დაგეხმარო?",
             reply_markup=main_menu_keyboard(),
+        )
+    elif ob_state.startswith("learn:"):
+        await update.message.reply_text(
+            "კვლავ გამარჯობა! 👋 სასწავლო რეჟიმში ხარ.\n\nრა გინდა ისწავლო?",
+            reply_markup=learning_topic_keyboard(),
         )
     else:
         await send_onboarding_choice(update)
@@ -831,6 +944,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel_reset":
         await query.edit_message_text("❌ გაუქმდა. ყველაფერი ისევ ადგილზეა ✅")
+        return
+
+    # ── Role choice ───────────────────────────────────────────────────────────
+    if data == "role_business":
+        await send_business_choice(update, edit=True)
+        return
+
+    if data == "role_student":
+        set_onboarding_state(user_id, "learn:learn_free")
+        await send_learning_choice(update, edit=True)
+        return
+
+    if data == "back_to_role":
+        set_onboarding_state(user_id, "none")
+        await send_onboarding_choice(update, edit=True)
+        return
+
+    # ── Learning mode ────────────────────────────────────────────────────────
+    if data.startswith("learn_"):
+        topic_key   = data
+        topic_label = LEARNING_TOPICS.get(topic_key, LEARNING_TOPICS["learn_free"])
+        set_onboarding_state(user_id, f"learn:{topic_key}")
+        clear_history(user_id)
+
+        topic_names = {
+            "learn_accounting": "📚 ბუღალტრია — საფუძვლები",
+            "learn_tax":         "💰 საგადასახადო სისტემა",
+            "learn_finance":     "📊 ფინანსური ანალიზი",
+            "learn_investing":   "📈 ინვესტიციები",
+            "learn_acca":        "🎓 ACCA მომზადება",
+            "learn_free":        "❓ თავისუფალი კითხვა",
+        }
+        topic_name = topic_names.get(topic_key, "სასწავლო რეჟიმი")
+
+        await query.edit_message_text(
+            f"{topic_name}\n\nდავიწყოთ! რა გინდა იცოდე ამ თემაზე, ან დაგისვამ შემავალ კითხვას.",
+            parse_mode="Markdown",
+        )
+        await run_ai_and_reply(
+            update, context, user_id,
+            f"The student chose this learning topic: {topic_label}. "
+            f"Greet them briefly and ask what specifically they'd like to learn or "
+            f"what their current level is, so you can tailor the explanation.",
+            mode=f"learn:{topic_key}", save_user_msg=False,
+        )
         return
 
     # ── Edit fact ─────────────────────────────────────────────────────────────
@@ -972,6 +1130,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ob_state = get_onboarding_state(user_id)
         if ob_state == "done":
             await query.edit_message_text("რით შეგიძლია დაგეხმარო?", reply_markup=main_menu_keyboard())
+        elif ob_state.startswith("learn:"):
+            await send_learning_choice(update, edit=True)
         else:
             await send_onboarding_choice(update, edit=True)
         return
@@ -1036,7 +1196,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_onboarding_choice(update)
         return
 
-    mode = ob_state if ob_state in ("full", "quick") else "chat"
+    if ob_state in ("full", "quick"):
+        mode = ob_state
+    elif ob_state.startswith("learn:"):
+        mode = ob_state
+    else:
+        mode = "chat"
     await run_ai_and_reply(update, context, user_id, user_text, mode=mode)
 
 
