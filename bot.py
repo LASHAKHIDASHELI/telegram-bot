@@ -709,6 +709,12 @@ def learning_topic_keyboard():
     ])
 
 
+def learning_chat_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 თემის შეცვლა", callback_data="learn_change_topic")],
+    ])
+
+
 def edit_list_keyboard(memories: list[tuple[str, str]]):
     buttons = []
     for mem_key, fact in memories:
@@ -811,7 +817,7 @@ async def run_ai_and_reply(
     if ob_state == "done":
         await update.effective_message.reply_text(reply, reply_markup=main_menu_keyboard())
     elif ob_state.startswith("learn:"):
-        await update.effective_message.reply_text(reply, reply_markup=learning_topic_keyboard())
+        await update.effective_message.reply_text(reply, reply_markup=learning_chat_keyboard())
     else:
         await update.effective_message.reply_text(reply)
 
@@ -959,6 +965,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_to_role":
         set_onboarding_state(user_id, "none")
         await send_onboarding_choice(update, edit=True)
+        return
+
+    if data == "learn_change_topic":
+        await send_learning_choice(update, edit=True)
         return
 
     # ── Learning mode ────────────────────────────────────────────────────────
