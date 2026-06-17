@@ -1045,6 +1045,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Onboarding ────────────────────────────────────────────────────────────
     if data == "start_full":
         set_onboarding_state(user_id, "full")
+        clear_history(user_id)
         await query.edit_message_text(
             "📋 *სრული კითხვარი*\n\n13 კითხვა — ყოველი პასუხი სამუდამოდ შეინახება.\n\nდავიწყოთ 👇",
             parse_mode="Markdown",
@@ -1058,6 +1059,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "start_quick":
         set_onboarding_state(user_id, "quick")
+        clear_history(user_id)
         await query.edit_message_text(
             "⚡ *სწრაფი კითხვარი*\n\n4 კითხვა — სწრაფი დასაწყისი.\n\nდავიწყოთ 👇",
             parse_mode="Markdown",
